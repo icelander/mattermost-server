@@ -5179,10 +5179,6 @@
     "translation": "分頁已達限制"
   },
   {
-    "id": "store.sql_audit.permanent_delete_batch.app_error",
-    "translation": "永久批次刪除稽核時遇到錯誤"
-  },
-  {
     "id": "store.sql_audit.permanent_delete_by_user.app_error",
     "translation": "刪除稽核紀錄時遇到錯誤"
   },
@@ -6021,10 +6017,6 @@
   {
     "id": "store.sql_post.permanent_delete_by_user.too_many.app_error",
     "translation": "無法選擇該使用者的訊息以刪除 (數量太多)，請重新執行"
-  },
-  {
-    "id": "store.sql_post.query_max_post_size.error",
-    "translation": "無法判定最大支援的訊息大小"
   },
   {
     "id": "store.sql_post.save.app_error",

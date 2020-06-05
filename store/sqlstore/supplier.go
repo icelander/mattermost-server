@@ -1,5 +1,5 @@
-// Copyright (c) 2016-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
 
 package sqlstore
 
@@ -9,9 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	sqltrace "log"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -20,11 +20,11 @@ import (
 	"github.com/go-sql-driver/mysql"
 	"github.com/lib/pq"
 	"github.com/mattermost/gorp"
-	"github.com/mattermost/mattermost-server/einterfaces"
-	"github.com/mattermost/mattermost-server/mlog"
-	"github.com/mattermost/mattermost-server/model"
-	"github.com/mattermost/mattermost-server/store"
-	"github.com/mattermost/mattermost-server/utils"
+	"github.com/mattermost/mattermost-server/v5/einterfaces"
+	"github.com/mattermost/mattermost-server/v5/mlog"
+	"github.com/mattermost/mattermost-server/v5/model"
+	"github.com/mattermost/mattermost-server/v5/store"
+	"github.com/mattermost/mattermost-server/v5/utils"
 )
 
 const (
@@ -65,9 +65,10 @@ const (
 	EXIT_REMOVE_INDEX_SQLITE         = 136
 	EXIT_TABLE_EXISTS_SQLITE         = 137
 	EXIT_DOES_COLUMN_EXISTS_SQLITE   = 138
+	EXIT_ALTER_PRIMARY_KEY           = 139
 )
 
-type SqlSupplierOldStores struct {
+type SqlSupplierStores struct {
 	team                 store.TeamStore
 	channel              store.ChannelStore
 	post                 store.PostStore
@@ -103,16 +104,28 @@ type SqlSupplierOldStores struct {
 
 type SqlSupplier struct {
 	// rrCounter and srCounter should be kept first.
-	// See https://github.com/mattermost/mattermost-server/pull/7281
+	// See https://github.com/mattermost/mattermost-server/v5/pull/7281
 	rrCounter      int64
 	srCounter      int64
-	next           store.LayeredStoreSupplier
 	master         *gorp.DbMap
 	replicas       []*gorp.DbMap
 	searchReplicas []*gorp.DbMap
-	oldStores      SqlSupplierOldStores
+	stores         SqlSupplierStores
 	settings       *model.SqlSettings
 	lockedToMaster bool
+	context        context.Context
+	license        *model.License
+	licenseMutex   sync.Mutex
+}
+
+type TraceOnAdapter struct{}
+
+func (t *TraceOnAdapter) Printf(format string, v ...interface{}) {
+	originalString := fmt.Sprintf(format, v...)
+	newString := strings.ReplaceAll(originalString, "\n", " ")
+	newString = strings.ReplaceAll(newString, "\t", " ")
+	newString = strings.ReplaceAll(newString, "\"", "")
+	mlog.Debug(newString)
 }
 
 func NewSqlSupplier(settings model.SqlSettings, metrics einterfaces.MetricsInterface) *SqlSupplier {
@@ -124,103 +137,94 @@ func NewSqlSupplier(settings model.SqlSettings, metrics einterfaces.MetricsInter
 
 	supplier.initConnection()
 
-	supplier.oldStores.team = NewSqlTeamStore(supplier, metrics)
-	supplier.oldStores.channel = NewSqlChannelStore(supplier, metrics)
-	supplier.oldStores.post = NewSqlPostStore(supplier, metrics)
-	supplier.oldStores.user = NewSqlUserStore(supplier, metrics)
-	supplier.oldStores.bot = NewSqlBotStore(supplier, metrics)
-	supplier.oldStores.audit = NewSqlAuditStore(supplier)
-	supplier.oldStores.cluster = NewSqlClusterDiscoveryStore(supplier)
-	supplier.oldStores.compliance = NewSqlComplianceStore(supplier)
-	supplier.oldStores.session = NewSqlSessionStore(supplier)
-	supplier.oldStores.oauth = NewSqlOAuthStore(supplier)
-	supplier.oldStores.system = NewSqlSystemStore(supplier)
-	supplier.oldStores.webhook = NewSqlWebhookStore(supplier, metrics)
-	supplier.oldStores.command = NewSqlCommandStore(supplier)
-	supplier.oldStores.commandWebhook = NewSqlCommandWebhookStore(supplier)
-	supplier.oldStores.preference = NewSqlPreferenceStore(supplier)
-	supplier.oldStores.license = NewSqlLicenseStore(supplier)
-	supplier.oldStores.token = NewSqlTokenStore(supplier)
-	supplier.oldStores.emoji = NewSqlEmojiStore(supplier, metrics)
-	supplier.oldStores.status = NewSqlStatusStore(supplier)
-	supplier.oldStores.fileInfo = NewSqlFileInfoStore(supplier, metrics)
-	supplier.oldStores.job = NewSqlJobStore(supplier)
-	supplier.oldStores.userAccessToken = NewSqlUserAccessTokenStore(supplier)
-	supplier.oldStores.channelMemberHistory = NewSqlChannelMemberHistoryStore(supplier)
-	supplier.oldStores.plugin = NewSqlPluginStore(supplier)
-	supplier.oldStores.TermsOfService = NewSqlTermsOfServiceStore(supplier, metrics)
-	supplier.oldStores.UserTermsOfService = NewSqlUserTermsOfServiceStore(supplier)
-	supplier.oldStores.linkMetadata = NewSqlLinkMetadataStore(supplier)
-	supplier.oldStores.group = NewSqlGroupStore(supplier)
-
-	initSqlSupplierReactions(supplier)
-	initSqlSupplierRoles(supplier)
-	initSqlSupplierSchemes(supplier)
+	supplier.stores.team = newSqlTeamStore(supplier)
+	supplier.stores.channel = newSqlChannelStore(supplier, metrics)
+	supplier.stores.post = newSqlPostStore(supplier, metrics)
+	supplier.stores.user = newSqlUserStore(supplier, metrics)
+	supplier.stores.bot = newSqlBotStore(supplier, metrics)
+	supplier.stores.audit = newSqlAuditStore(supplier)
+	supplier.stores.cluster = newSqlClusterDiscoveryStore(supplier)
+	supplier.stores.compliance = newSqlComplianceStore(supplier)
+	supplier.stores.session = newSqlSessionStore(supplier)
+	supplier.stores.oauth = newSqlOAuthStore(supplier)
+	supplier.stores.system = newSqlSystemStore(supplier)
+	supplier.stores.webhook = newSqlWebhookStore(supplier, metrics)
+	supplier.stores.command = newSqlCommandStore(supplier)
+	supplier.stores.commandWebhook = newSqlCommandWebhookStore(supplier)
+	supplier.stores.preference = newSqlPreferenceStore(supplier)
+	supplier.stores.license = newSqlLicenseStore(supplier)
+	supplier.stores.token = newSqlTokenStore(supplier)
+	supplier.stores.emoji = newSqlEmojiStore(supplier, metrics)
+	supplier.stores.status = newSqlStatusStore(supplier)
+	supplier.stores.fileInfo = newSqlFileInfoStore(supplier, metrics)
+	supplier.stores.job = newSqlJobStore(supplier)
+	supplier.stores.userAccessToken = newSqlUserAccessTokenStore(supplier)
+	supplier.stores.channelMemberHistory = newSqlChannelMemberHistoryStore(supplier)
+	supplier.stores.plugin = newSqlPluginStore(supplier)
+	supplier.stores.TermsOfService = newSqlTermsOfServiceStore(supplier, metrics)
+	supplier.stores.UserTermsOfService = newSqlUserTermsOfServiceStore(supplier)
+	supplier.stores.linkMetadata = newSqlLinkMetadataStore(supplier)
+	supplier.stores.reaction = newSqlReactionStore(supplier)
+	supplier.stores.role = newSqlRoleStore(supplier)
+	supplier.stores.scheme = newSqlSchemeStore(supplier)
+	supplier.stores.group = newSqlGroupStore(supplier)
 
 	err := supplier.GetMaster().CreateTablesIfNotExists()
 	if err != nil {
-		mlog.Critical(fmt.Sprintf("Error creating database tables: %v", err))
+		mlog.Critical("Error creating database tables.", mlog.Err(err))
 		time.Sleep(time.Second)
 		os.Exit(EXIT_CREATE_TABLE)
 	}
 
-	err = UpgradeDatabase(supplier, model.CurrentVersion)
+	err = upgradeDatabase(supplier, model.CurrentVersion)
 	if err != nil {
-		mlog.Critical("Failed to upgrade database", mlog.Err(err))
+		mlog.Critical("Failed to upgrade database.", mlog.Err(err))
 		time.Sleep(time.Second)
 		os.Exit(EXIT_GENERIC_FAILURE)
 	}
 
-	supplier.oldStores.team.(*SqlTeamStore).CreateIndexesIfNotExists()
-	supplier.oldStores.channel.(*SqlChannelStore).CreateIndexesIfNotExists()
-	supplier.oldStores.post.(*SqlPostStore).CreateIndexesIfNotExists()
-	supplier.oldStores.user.(*SqlUserStore).CreateIndexesIfNotExists()
-	supplier.oldStores.bot.(*SqlBotStore).CreateIndexesIfNotExists()
-	supplier.oldStores.audit.(*SqlAuditStore).CreateIndexesIfNotExists()
-	supplier.oldStores.compliance.(*SqlComplianceStore).CreateIndexesIfNotExists()
-	supplier.oldStores.session.(*SqlSessionStore).CreateIndexesIfNotExists()
-	supplier.oldStores.oauth.(*SqlOAuthStore).CreateIndexesIfNotExists()
-	supplier.oldStores.system.(*SqlSystemStore).CreateIndexesIfNotExists()
-	supplier.oldStores.webhook.(*SqlWebhookStore).CreateIndexesIfNotExists()
-	supplier.oldStores.command.(*SqlCommandStore).CreateIndexesIfNotExists()
-	supplier.oldStores.commandWebhook.(*SqlCommandWebhookStore).CreateIndexesIfNotExists()
-	supplier.oldStores.preference.(*SqlPreferenceStore).CreateIndexesIfNotExists()
-	supplier.oldStores.license.(*SqlLicenseStore).CreateIndexesIfNotExists()
-	supplier.oldStores.token.(*SqlTokenStore).CreateIndexesIfNotExists()
-	supplier.oldStores.emoji.(*SqlEmojiStore).CreateIndexesIfNotExists()
-	supplier.oldStores.status.(*SqlStatusStore).CreateIndexesIfNotExists()
-	supplier.oldStores.fileInfo.(*SqlFileInfoStore).CreateIndexesIfNotExists()
-	supplier.oldStores.job.(*SqlJobStore).CreateIndexesIfNotExists()
-	supplier.oldStores.userAccessToken.(*SqlUserAccessTokenStore).CreateIndexesIfNotExists()
-	supplier.oldStores.plugin.(*SqlPluginStore).CreateIndexesIfNotExists()
-	supplier.oldStores.TermsOfService.(SqlTermsOfServiceStore).CreateIndexesIfNotExists()
-	supplier.oldStores.UserTermsOfService.(SqlUserTermsOfServiceStore).CreateIndexesIfNotExists()
-	supplier.oldStores.linkMetadata.(*SqlLinkMetadataStore).CreateIndexesIfNotExists()
-	supplier.oldStores.group.(*SqlGroupStore).CreateIndexesIfNotExists()
-
-	supplier.oldStores.preference.(*SqlPreferenceStore).DeleteUnusedFeatures()
+	supplier.stores.team.(*SqlTeamStore).createIndexesIfNotExists()
+	supplier.stores.channel.(*SqlChannelStore).createIndexesIfNotExists()
+	supplier.stores.post.(*SqlPostStore).createIndexesIfNotExists()
+	supplier.stores.user.(*SqlUserStore).createIndexesIfNotExists()
+	supplier.stores.bot.(*SqlBotStore).createIndexesIfNotExists()
+	supplier.stores.audit.(*SqlAuditStore).createIndexesIfNotExists()
+	supplier.stores.compliance.(*SqlComplianceStore).createIndexesIfNotExists()
+	supplier.stores.session.(*SqlSessionStore).createIndexesIfNotExists()
+	supplier.stores.oauth.(*SqlOAuthStore).createIndexesIfNotExists()
+	supplier.stores.system.(*SqlSystemStore).createIndexesIfNotExists()
+	supplier.stores.webhook.(*SqlWebhookStore).createIndexesIfNotExists()
+	supplier.stores.command.(*SqlCommandStore).createIndexesIfNotExists()
+	supplier.stores.commandWebhook.(*SqlCommandWebhookStore).createIndexesIfNotExists()
+	supplier.stores.preference.(*SqlPreferenceStore).createIndexesIfNotExists()
+	supplier.stores.license.(*SqlLicenseStore).createIndexesIfNotExists()
+	supplier.stores.token.(*SqlTokenStore).createIndexesIfNotExists()
+	supplier.stores.emoji.(*SqlEmojiStore).createIndexesIfNotExists()
+	supplier.stores.status.(*SqlStatusStore).createIndexesIfNotExists()
+	supplier.stores.fileInfo.(*SqlFileInfoStore).createIndexesIfNotExists()
+	supplier.stores.job.(*SqlJobStore).createIndexesIfNotExists()
+	supplier.stores.userAccessToken.(*SqlUserAccessTokenStore).createIndexesIfNotExists()
+	supplier.stores.plugin.(*SqlPluginStore).createIndexesIfNotExists()
+	supplier.stores.TermsOfService.(SqlTermsOfServiceStore).createIndexesIfNotExists()
+	supplier.stores.UserTermsOfService.(SqlUserTermsOfServiceStore).createIndexesIfNotExists()
+	supplier.stores.linkMetadata.(*SqlLinkMetadataStore).createIndexesIfNotExists()
+	supplier.stores.group.(*SqlGroupStore).createIndexesIfNotExists()
+	supplier.stores.scheme.(*SqlSchemeStore).createIndexesIfNotExists()
+	supplier.stores.preference.(*SqlPreferenceStore).deleteUnusedFeatures()
 
 	return supplier
-}
-
-func (s *SqlSupplier) SetChainNext(next store.LayeredStoreSupplier) {
-	s.next = next
-}
-
-func (s *SqlSupplier) Next() store.LayeredStoreSupplier {
-	return s.next
 }
 
 func setupConnection(con_type string, dataSource string, settings *model.SqlSettings) *gorp.DbMap {
 	db, err := dbsql.Open(*settings.DriverName, dataSource)
 	if err != nil {
-		mlog.Critical(fmt.Sprintf("Failed to open SQL connection to err:%v", err.Error()))
+		mlog.Critical("Failed to open SQL connection to err.", mlog.Err(err))
 		time.Sleep(time.Second)
 		os.Exit(EXIT_DB_OPEN)
 	}
 
 	for i := 0; i < DB_PING_ATTEMPTS; i++ {
-		mlog.Info(fmt.Sprintf("Pinging SQL %v database", con_type))
+		mlog.Info("Pinging SQL", mlog.String("database", con_type))
 		ctx, cancel := context.WithTimeout(context.Background(), DB_PING_TIMEOUT_SECS*time.Second)
 		defer cancel()
 		err = db.PingContext(ctx)
@@ -228,11 +232,11 @@ func setupConnection(con_type string, dataSource string, settings *model.SqlSett
 			break
 		} else {
 			if i == DB_PING_ATTEMPTS-1 {
-				mlog.Critical(fmt.Sprintf("Failed to ping DB, server will exit err=%v", err))
+				mlog.Critical("Failed to ping DB, server will exit.", mlog.Err(err))
 				time.Sleep(time.Second)
 				os.Exit(EXIT_PING)
 			} else {
-				mlog.Error(fmt.Sprintf("Failed to ping DB retrying in %v seconds err=%v", DB_PING_TIMEOUT_SECS, err))
+				mlog.Error("Failed to ping DB", mlog.Err(err), mlog.Int("retrying in seconds", DB_PING_TIMEOUT_SECS))
 				time.Sleep(DB_PING_TIMEOUT_SECS * time.Second)
 			}
 		}
@@ -259,26 +263,34 @@ func setupConnection(con_type string, dataSource string, settings *model.SqlSett
 	}
 
 	if settings.Trace != nil && *settings.Trace {
-		dbmap.TraceOn("", sqltrace.New(os.Stdout, "sql-trace:", sqltrace.Lmicroseconds))
+		dbmap.TraceOn("sql-trace:", &TraceOnAdapter{})
 	}
 
 	return dbmap
 }
 
-func (s *SqlSupplier) initConnection() {
-	s.master = setupConnection("master", *s.settings.DataSource, s.settings)
+func (ss *SqlSupplier) SetContext(context context.Context) {
+	ss.context = context
+}
 
-	if len(s.settings.DataSourceReplicas) > 0 {
-		s.replicas = make([]*gorp.DbMap, len(s.settings.DataSourceReplicas))
-		for i, replica := range s.settings.DataSourceReplicas {
-			s.replicas[i] = setupConnection(fmt.Sprintf("replica-%v", i), replica, s.settings)
+func (ss *SqlSupplier) Context() context.Context {
+	return ss.context
+}
+
+func (ss *SqlSupplier) initConnection() {
+	ss.master = setupConnection("master", *ss.settings.DataSource, ss.settings)
+
+	if len(ss.settings.DataSourceReplicas) > 0 {
+		ss.replicas = make([]*gorp.DbMap, len(ss.settings.DataSourceReplicas))
+		for i, replica := range ss.settings.DataSourceReplicas {
+			ss.replicas[i] = setupConnection(fmt.Sprintf("replica-%v", i), replica, ss.settings)
 		}
 	}
 
-	if len(s.settings.DataSourceSearchReplicas) > 0 {
-		s.searchReplicas = make([]*gorp.DbMap, len(s.settings.DataSourceSearchReplicas))
-		for i, replica := range s.settings.DataSourceSearchReplicas {
-			s.searchReplicas[i] = setupConnection(fmt.Sprintf("search-replica-%v", i), replica, s.settings)
+	if len(ss.settings.DataSourceSearchReplicas) > 0 {
+		ss.searchReplicas = make([]*gorp.DbMap, len(ss.settings.DataSourceSearchReplicas))
+		for i, replica := range ss.settings.DataSourceSearchReplicas {
+			ss.searchReplicas[i] = setupConnection(fmt.Sprintf("search-replica-%v", i), replica, ss.settings)
 		}
 	}
 }
@@ -292,11 +304,36 @@ func (ss *SqlSupplier) GetCurrentSchemaVersion() string {
 	return version
 }
 
+func (ss *SqlSupplier) GetDbVersion() (string, error) {
+	var sqlVersion string
+	if ss.DriverName() == model.DATABASE_DRIVER_POSTGRES {
+		sqlVersion = `SHOW server_version`
+	} else if ss.DriverName() == model.DATABASE_DRIVER_MYSQL {
+		sqlVersion = `SELECT version()`
+	} else if ss.DriverName() == model.DATABASE_DRIVER_SQLITE {
+		sqlVersion = `SELECT sqlite_version()`
+	} else {
+		return "", errors.New("Not supported driver")
+	}
+
+	version, err := ss.GetReplica().SelectStr(sqlVersion)
+	if err != nil {
+		return "", err
+	}
+
+	return version, nil
+
+}
+
 func (ss *SqlSupplier) GetMaster() *gorp.DbMap {
 	return ss.master
 }
 
 func (ss *SqlSupplier) GetSearchReplica() *gorp.DbMap {
+	if ss.license == nil {
+		return ss.GetMaster()
+	}
+
 	if len(ss.settings.DataSourceSearchReplicas) == 0 {
 		return ss.GetReplica()
 	}
@@ -306,7 +343,7 @@ func (ss *SqlSupplier) GetSearchReplica() *gorp.DbMap {
 }
 
 func (ss *SqlSupplier) GetReplica() *gorp.DbMap {
-	if len(ss.settings.DataSourceReplicas) == 0 || ss.lockedToMaster {
+	if len(ss.settings.DataSourceReplicas) == 0 || ss.lockedToMaster || ss.license == nil {
 		return ss.GetMaster()
 	}
 
@@ -365,7 +402,7 @@ func (ss *SqlSupplier) DoesTableExist(tableName string) bool {
 		)
 
 		if err != nil {
-			mlog.Critical(fmt.Sprintf("Failed to check if table exists %v", err))
+			mlog.Critical("Failed to check if table exists", mlog.Err(err))
 			time.Sleep(time.Second)
 			os.Exit(EXIT_TABLE_EXISTS)
 		}
@@ -387,7 +424,7 @@ func (ss *SqlSupplier) DoesTableExist(tableName string) bool {
 		)
 
 		if err != nil {
-			mlog.Critical(fmt.Sprintf("Failed to check if table exists %v", err))
+			mlog.Critical("Failed to check if table exists", mlog.Err(err))
 			time.Sleep(time.Second)
 			os.Exit(EXIT_TABLE_EXISTS_MYSQL)
 		}
@@ -396,12 +433,12 @@ func (ss *SqlSupplier) DoesTableExist(tableName string) bool {
 
 	} else if ss.DriverName() == model.DATABASE_DRIVER_SQLITE {
 		count, err := ss.GetMaster().SelectInt(
-			`SELECT name FROM sqlite_master WHERE type='table' AND name=?`,
+			`SELECT count(name) FROM sqlite_master WHERE type='table' AND name=?`,
 			tableName,
 		)
 
 		if err != nil {
-			mlog.Critical(fmt.Sprintf("Failed to check if table exists %v", err))
+			mlog.Critical("Failed to check if table exists", mlog.Err(err))
 			time.Sleep(time.Second)
 			os.Exit(EXIT_TABLE_EXISTS_SQLITE)
 		}
@@ -433,7 +470,7 @@ func (ss *SqlSupplier) DoesColumnExist(tableName string, columnName string) bool
 				return false
 			}
 
-			mlog.Critical(fmt.Sprintf("Failed to check if column exists %v", err))
+			mlog.Critical("Failed to check if column exists", mlog.Err(err))
 			time.Sleep(time.Second)
 			os.Exit(EXIT_DOES_COLUMN_EXISTS_POSTGRES)
 		}
@@ -456,7 +493,7 @@ func (ss *SqlSupplier) DoesColumnExist(tableName string, columnName string) bool
 		)
 
 		if err != nil {
-			mlog.Critical(fmt.Sprintf("Failed to check if column exists %v", err))
+			mlog.Critical("Failed to check if column exists", mlog.Err(err))
 			time.Sleep(time.Second)
 			os.Exit(EXIT_DOES_COLUMN_EXISTS_MYSQL)
 		}
@@ -471,7 +508,7 @@ func (ss *SqlSupplier) DoesColumnExist(tableName string, columnName string) bool
 		)
 
 		if err != nil {
-			mlog.Critical(fmt.Sprintf("Failed to check if column exists %v", err))
+			mlog.Critical("Failed to check if column exists", mlog.Err(err))
 			time.Sleep(time.Second)
 			os.Exit(EXIT_DOES_COLUMN_EXISTS_SQLITE)
 		}
@@ -498,7 +535,7 @@ func (ss *SqlSupplier) DoesTriggerExist(triggerName string) bool {
 		`, triggerName)
 
 		if err != nil {
-			mlog.Critical(fmt.Sprintf("Failed to check if trigger exists %v", err))
+			mlog.Critical("Failed to check if trigger exists", mlog.Err(err))
 			time.Sleep(time.Second)
 			os.Exit(EXIT_GENERIC_FAILURE)
 		}
@@ -517,7 +554,7 @@ func (ss *SqlSupplier) DoesTriggerExist(triggerName string) bool {
 		`, triggerName)
 
 		if err != nil {
-			mlog.Critical(fmt.Sprintf("Failed to check if trigger exists %v", err))
+			mlog.Critical("Failed to check if trigger exists", mlog.Err(err))
 			time.Sleep(time.Second)
 			os.Exit(EXIT_GENERIC_FAILURE)
 		}
@@ -541,7 +578,7 @@ func (ss *SqlSupplier) CreateColumnIfNotExists(tableName string, columnName stri
 	if ss.DriverName() == model.DATABASE_DRIVER_POSTGRES {
 		_, err := ss.GetMaster().ExecNoTimeout("ALTER TABLE " + tableName + " ADD " + columnName + " " + postgresColType + " DEFAULT '" + defaultValue + "'")
 		if err != nil {
-			mlog.Critical(fmt.Sprintf("Failed to create column %v", err))
+			mlog.Critical("Failed to create column", mlog.Err(err))
 			time.Sleep(time.Second)
 			os.Exit(EXIT_CREATE_COLUMN_POSTGRES)
 		}
@@ -551,7 +588,7 @@ func (ss *SqlSupplier) CreateColumnIfNotExists(tableName string, columnName stri
 	} else if ss.DriverName() == model.DATABASE_DRIVER_MYSQL {
 		_, err := ss.GetMaster().ExecNoTimeout("ALTER TABLE " + tableName + " ADD " + columnName + " " + mySqlColType + " DEFAULT '" + defaultValue + "'")
 		if err != nil {
-			mlog.Critical(fmt.Sprintf("Failed to create column %v", err))
+			mlog.Critical("Failed to create column", mlog.Err(err))
 			time.Sleep(time.Second)
 			os.Exit(EXIT_CREATE_COLUMN_MYSQL)
 		}
@@ -575,7 +612,7 @@ func (ss *SqlSupplier) CreateColumnIfNotExistsNoDefault(tableName string, column
 	if ss.DriverName() == model.DATABASE_DRIVER_POSTGRES {
 		_, err := ss.GetMaster().ExecNoTimeout("ALTER TABLE " + tableName + " ADD " + columnName + " " + postgresColType)
 		if err != nil {
-			mlog.Critical(fmt.Sprintf("Failed to create column %v", err))
+			mlog.Critical("Failed to create column", mlog.Err(err))
 			time.Sleep(time.Second)
 			os.Exit(EXIT_CREATE_COLUMN_POSTGRES)
 		}
@@ -585,7 +622,7 @@ func (ss *SqlSupplier) CreateColumnIfNotExistsNoDefault(tableName string, column
 	} else if ss.DriverName() == model.DATABASE_DRIVER_MYSQL {
 		_, err := ss.GetMaster().ExecNoTimeout("ALTER TABLE " + tableName + " ADD " + columnName + " " + mySqlColType)
 		if err != nil {
-			mlog.Critical(fmt.Sprintf("Failed to create column %v", err))
+			mlog.Critical("Failed to create column", mlog.Err(err))
 			time.Sleep(time.Second)
 			os.Exit(EXIT_CREATE_COLUMN_MYSQL)
 		}
@@ -608,7 +645,7 @@ func (ss *SqlSupplier) RemoveColumnIfExists(tableName string, columnName string)
 
 	_, err := ss.GetMaster().ExecNoTimeout("ALTER TABLE " + tableName + " DROP COLUMN " + columnName)
 	if err != nil {
-		mlog.Critical(fmt.Sprintf("Failed to drop column %v", err))
+		mlog.Critical("Failed to drop column", mlog.Err(err))
 		time.Sleep(time.Second)
 		os.Exit(EXIT_REMOVE_COLUMN)
 	}
@@ -623,7 +660,7 @@ func (ss *SqlSupplier) RemoveTableIfExists(tableName string) bool {
 
 	_, err := ss.GetMaster().ExecNoTimeout("DROP TABLE " + tableName)
 	if err != nil {
-		mlog.Critical(fmt.Sprintf("Failed to drop table %v", err))
+		mlog.Critical("Failed to drop table", mlog.Err(err))
 		time.Sleep(time.Second)
 		os.Exit(EXIT_REMOVE_TABLE)
 	}
@@ -644,7 +681,7 @@ func (ss *SqlSupplier) RenameColumnIfExists(tableName string, oldColumnName stri
 	}
 
 	if err != nil {
-		mlog.Critical(fmt.Sprintf("Failed to rename column %v", err))
+		mlog.Critical("Failed to rename column", mlog.Err(err))
 		time.Sleep(time.Second)
 		os.Exit(EXIT_RENAME_COLUMN)
 	}
@@ -666,7 +703,7 @@ func (ss *SqlSupplier) GetMaxLengthOfColumnIfExists(tableName string, columnName
 	}
 
 	if err != nil {
-		mlog.Critical(fmt.Sprintf("Failed to get max length of column %v", err))
+		mlog.Critical("Failed to get max length of column", mlog.Err(err))
 		time.Sleep(time.Second)
 		os.Exit(EXIT_MAX_COLUMN)
 	}
@@ -687,7 +724,7 @@ func (ss *SqlSupplier) AlterColumnTypeIfExists(tableName string, columnName stri
 	}
 
 	if err != nil {
-		mlog.Critical(fmt.Sprintf("Failed to alter column type %v", err))
+		mlog.Critical("Failed to alter column type", mlog.Err(err))
 		time.Sleep(time.Second)
 		os.Exit(EXIT_ALTER_COLUMN)
 	}
@@ -700,7 +737,7 @@ func (ss *SqlSupplier) AlterColumnDefaultIfExists(tableName string, columnName s
 		return false
 	}
 
-	var defaultValue = ""
+	var defaultValue string
 	if ss.DriverName() == model.DATABASE_DRIVER_MYSQL {
 		// Some column types in MySQL cannot have defaults, so don't try to configure anything.
 		if mySqlColDefault == nil {
@@ -736,12 +773,72 @@ func (ss *SqlSupplier) AlterColumnDefaultIfExists(tableName string, columnName s
 	}
 
 	if err != nil {
-		mlog.Critical(fmt.Sprintf("Failed to alter column %s.%s default %s: %v", tableName, columnName, defaultValue, err))
+		mlog.Critical("Failed to alter column", mlog.String("table", tableName), mlog.String("column", columnName), mlog.String("default value", defaultValue), mlog.Err(err))
 		time.Sleep(time.Second)
 		os.Exit(EXIT_GENERIC_FAILURE)
 		return false
 	}
 
+	return true
+}
+
+func (ss *SqlSupplier) AlterPrimaryKey(tableName string, columnNames []string) bool {
+	var currentPrimaryKey string
+	var err error
+	// get the current primary key as a comma separated list of columns
+	if ss.DriverName() == model.DATABASE_DRIVER_MYSQL {
+		query := `
+			SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index) AS PK
+		FROM
+			information_schema.statistics
+		WHERE
+			table_schema = DATABASE()
+		AND table_name = ?
+		AND index_name = 'PRIMARY'
+		GROUP BY
+			index_name`
+		currentPrimaryKey, err = ss.GetMaster().SelectStr(query, tableName)
+	} else if ss.DriverName() == model.DATABASE_DRIVER_POSTGRES {
+		query := `
+			SELECT string_agg(a.attname, ',') AS pk
+		FROM
+			pg_constraint AS c
+		CROSS JOIN LATERAL
+			UNNEST(c.conkey) AS cols(colnum)
+		INNER JOIN
+			pg_attribute AS a ON a.attrelid = c.conrelid
+		AND cols.colnum = a.attnum
+		WHERE
+			c.contype = 'p'
+		AND c.conrelid = '` + strings.ToLower(tableName) + `'::REGCLASS`
+		currentPrimaryKey, err = ss.GetMaster().SelectStr(query)
+	} else if ss.DriverName() == model.DATABASE_DRIVER_SQLITE {
+		// SQLite doesn't support altering primary key
+		return true
+	}
+	if err != nil {
+		mlog.Critical("Failed to get current primary key", mlog.String("table", tableName), mlog.Err(err))
+		time.Sleep(time.Second)
+		os.Exit(EXIT_ALTER_PRIMARY_KEY)
+	}
+
+	primaryKey := strings.Join(columnNames, ",")
+	if strings.EqualFold(currentPrimaryKey, primaryKey) {
+		return false
+	}
+	// alter primary key
+	var alterQuery string
+	if ss.DriverName() == model.DATABASE_DRIVER_MYSQL {
+		alterQuery = "ALTER TABLE " + tableName + " DROP PRIMARY KEY, ADD PRIMARY KEY (" + primaryKey + ")"
+	} else if ss.DriverName() == model.DATABASE_DRIVER_POSTGRES {
+		alterQuery = "ALTER TABLE " + tableName + " DROP CONSTRAINT " + strings.ToLower(tableName) + "_pkey, ADD PRIMARY KEY (" + strings.ToLower(primaryKey) + ")"
+	}
+	_, err = ss.GetMaster().ExecNoTimeout(alterQuery)
+	if err != nil {
+		mlog.Critical("Failed to alter primary key", mlog.String("table", tableName), mlog.Err(err))
+		time.Sleep(time.Second)
+		os.Exit(EXIT_ALTER_PRIMARY_KEY)
+	}
 	return true
 }
 
@@ -790,7 +887,7 @@ func (ss *SqlSupplier) createIndexIfNotExists(indexName string, tableName string
 
 		_, err := ss.GetMaster().ExecNoTimeout(query)
 		if err != nil {
-			mlog.Critical(fmt.Sprintf("Failed to create index %v, %v", errExists, err))
+			mlog.Critical("Failed to create index", mlog.Err(errExists), mlog.Err(err))
 			time.Sleep(time.Second)
 			os.Exit(EXIT_CREATE_INDEX_POSTGRES)
 		}
@@ -798,7 +895,7 @@ func (ss *SqlSupplier) createIndexIfNotExists(indexName string, tableName string
 
 		count, err := ss.GetMaster().SelectInt("SELECT COUNT(0) AS index_exists FROM information_schema.statistics WHERE TABLE_SCHEMA = DATABASE() and table_name = ? AND index_name = ?", tableName, indexName)
 		if err != nil {
-			mlog.Critical(fmt.Sprintf("Failed to check index %v", err))
+			mlog.Critical("Failed to check index", mlog.Err(err))
 			time.Sleep(time.Second)
 			os.Exit(EXIT_CREATE_INDEX_MYSQL)
 		}
@@ -814,14 +911,14 @@ func (ss *SqlSupplier) createIndexIfNotExists(indexName string, tableName string
 
 		_, err = ss.GetMaster().ExecNoTimeout("CREATE  " + uniqueStr + fullTextIndex + " INDEX " + indexName + " ON " + tableName + " (" + strings.Join(columnNames, ", ") + ")")
 		if err != nil {
-			mlog.Critical(fmt.Sprintf("Failed to create index %v", err))
+			mlog.Critical("Failed to create index", mlog.Err(err))
 			time.Sleep(time.Second)
 			os.Exit(EXIT_CREATE_INDEX_FULL_MYSQL)
 		}
 	} else if ss.DriverName() == model.DATABASE_DRIVER_SQLITE {
 		_, err := ss.GetMaster().ExecNoTimeout("CREATE INDEX IF NOT EXISTS " + indexName + " ON " + tableName + " (" + strings.Join(columnNames, ", ") + ")")
 		if err != nil {
-			mlog.Critical(fmt.Sprintf("Failed to create index %v", err))
+			mlog.Critical("Failed to create index", mlog.Err(err))
 			time.Sleep(time.Second)
 			os.Exit(EXIT_CREATE_INDEX_SQLITE)
 		}
@@ -845,7 +942,7 @@ func (ss *SqlSupplier) RemoveIndexIfExists(indexName string, tableName string) b
 
 		_, err = ss.GetMaster().ExecNoTimeout("DROP INDEX " + indexName)
 		if err != nil {
-			mlog.Critical(fmt.Sprintf("Failed to remove index %v", err))
+			mlog.Critical("Failed to remove index", mlog.Err(err))
 			time.Sleep(time.Second)
 			os.Exit(EXIT_REMOVE_INDEX_POSTGRES)
 		}
@@ -855,7 +952,7 @@ func (ss *SqlSupplier) RemoveIndexIfExists(indexName string, tableName string) b
 
 		count, err := ss.GetMaster().SelectInt("SELECT COUNT(0) AS index_exists FROM information_schema.statistics WHERE TABLE_SCHEMA = DATABASE() and table_name = ? AND index_name = ?", tableName, indexName)
 		if err != nil {
-			mlog.Critical(fmt.Sprintf("Failed to check index %v", err))
+			mlog.Critical("Failed to check index", mlog.Err(err))
 			time.Sleep(time.Second)
 			os.Exit(EXIT_REMOVE_INDEX_MYSQL)
 		}
@@ -866,14 +963,14 @@ func (ss *SqlSupplier) RemoveIndexIfExists(indexName string, tableName string) b
 
 		_, err = ss.GetMaster().ExecNoTimeout("DROP INDEX " + indexName + " ON " + tableName)
 		if err != nil {
-			mlog.Critical(fmt.Sprintf("Failed to remove index %v", err))
+			mlog.Critical("Failed to remove index", mlog.Err(err))
 			time.Sleep(time.Second)
 			os.Exit(EXIT_REMOVE_INDEX_MYSQL)
 		}
 	} else if ss.DriverName() == model.DATABASE_DRIVER_SQLITE {
 		_, err := ss.GetMaster().ExecNoTimeout("DROP INDEX IF EXISTS " + indexName)
 		if err != nil {
-			mlog.Critical(fmt.Sprintf("Failed to remove index %v", err))
+			mlog.Critical("Failed to remove index", mlog.Err(err))
 			time.Sleep(time.Second)
 			os.Exit(EXIT_REMOVE_INDEX_SQLITE)
 		}
@@ -914,8 +1011,24 @@ func (ss *SqlSupplier) GetAllConns() []*gorp.DbMap {
 	return all
 }
 
+// RecycleDBConnections closes active connections by setting the max conn lifetime
+// to d, and then resets them back to their original duration.
+func (ss *SqlSupplier) RecycleDBConnections(d time.Duration) {
+	// Get old time.
+	originalDuration := time.Duration(*ss.settings.ConnMaxLifetimeMilliseconds) * time.Millisecond
+	// Set the max lifetimes for all connections.
+	for _, conn := range ss.GetAllConns() {
+		conn.Db.SetConnMaxLifetime(d)
+	}
+	// Wait for that period with an additional 2 seconds of scheduling delay.
+	time.Sleep(d + 2*time.Second)
+	// Reset max lifetime back to original value.
+	for _, conn := range ss.GetAllConns() {
+		conn.Db.SetConnMaxLifetime(originalDuration)
+	}
+}
+
 func (ss *SqlSupplier) Close() {
-	mlog.Info("Closing SqlStore")
 	ss.master.Db.Close()
 	for _, replica := range ss.replicas {
 		replica.Db.Close()
@@ -931,127 +1044,127 @@ func (ss *SqlSupplier) UnlockFromMaster() {
 }
 
 func (ss *SqlSupplier) Team() store.TeamStore {
-	return ss.oldStores.team
+	return ss.stores.team
 }
 
 func (ss *SqlSupplier) Channel() store.ChannelStore {
-	return ss.oldStores.channel
+	return ss.stores.channel
 }
 
 func (ss *SqlSupplier) Post() store.PostStore {
-	return ss.oldStores.post
+	return ss.stores.post
 }
 
 func (ss *SqlSupplier) User() store.UserStore {
-	return ss.oldStores.user
+	return ss.stores.user
 }
 
 func (ss *SqlSupplier) Bot() store.BotStore {
-	return ss.oldStores.bot
+	return ss.stores.bot
 }
 
 func (ss *SqlSupplier) Session() store.SessionStore {
-	return ss.oldStores.session
+	return ss.stores.session
 }
 
 func (ss *SqlSupplier) Audit() store.AuditStore {
-	return ss.oldStores.audit
+	return ss.stores.audit
 }
 
 func (ss *SqlSupplier) ClusterDiscovery() store.ClusterDiscoveryStore {
-	return ss.oldStores.cluster
+	return ss.stores.cluster
 }
 
 func (ss *SqlSupplier) Compliance() store.ComplianceStore {
-	return ss.oldStores.compliance
+	return ss.stores.compliance
 }
 
 func (ss *SqlSupplier) OAuth() store.OAuthStore {
-	return ss.oldStores.oauth
+	return ss.stores.oauth
 }
 
 func (ss *SqlSupplier) System() store.SystemStore {
-	return ss.oldStores.system
+	return ss.stores.system
 }
 
 func (ss *SqlSupplier) Webhook() store.WebhookStore {
-	return ss.oldStores.webhook
+	return ss.stores.webhook
 }
 
 func (ss *SqlSupplier) Command() store.CommandStore {
-	return ss.oldStores.command
+	return ss.stores.command
 }
 
 func (ss *SqlSupplier) CommandWebhook() store.CommandWebhookStore {
-	return ss.oldStores.commandWebhook
+	return ss.stores.commandWebhook
 }
 
 func (ss *SqlSupplier) Preference() store.PreferenceStore {
-	return ss.oldStores.preference
+	return ss.stores.preference
 }
 
 func (ss *SqlSupplier) License() store.LicenseStore {
-	return ss.oldStores.license
+	return ss.stores.license
 }
 
 func (ss *SqlSupplier) Token() store.TokenStore {
-	return ss.oldStores.token
+	return ss.stores.token
 }
 
 func (ss *SqlSupplier) Emoji() store.EmojiStore {
-	return ss.oldStores.emoji
+	return ss.stores.emoji
 }
 
 func (ss *SqlSupplier) Status() store.StatusStore {
-	return ss.oldStores.status
+	return ss.stores.status
 }
 
 func (ss *SqlSupplier) FileInfo() store.FileInfoStore {
-	return ss.oldStores.fileInfo
+	return ss.stores.fileInfo
 }
 
 func (ss *SqlSupplier) Reaction() store.ReactionStore {
-	return ss.oldStores.reaction
+	return ss.stores.reaction
 }
 
 func (ss *SqlSupplier) Job() store.JobStore {
-	return ss.oldStores.job
+	return ss.stores.job
 }
 
 func (ss *SqlSupplier) UserAccessToken() store.UserAccessTokenStore {
-	return ss.oldStores.userAccessToken
+	return ss.stores.userAccessToken
 }
 
 func (ss *SqlSupplier) ChannelMemberHistory() store.ChannelMemberHistoryStore {
-	return ss.oldStores.channelMemberHistory
+	return ss.stores.channelMemberHistory
 }
 
 func (ss *SqlSupplier) Plugin() store.PluginStore {
-	return ss.oldStores.plugin
+	return ss.stores.plugin
 }
 
 func (ss *SqlSupplier) Role() store.RoleStore {
-	return ss.oldStores.role
+	return ss.stores.role
 }
 
 func (ss *SqlSupplier) TermsOfService() store.TermsOfServiceStore {
-	return ss.oldStores.TermsOfService
+	return ss.stores.TermsOfService
 }
 
 func (ss *SqlSupplier) UserTermsOfService() store.UserTermsOfServiceStore {
-	return ss.oldStores.UserTermsOfService
+	return ss.stores.UserTermsOfService
 }
 
 func (ss *SqlSupplier) Scheme() store.SchemeStore {
-	return ss.oldStores.scheme
+	return ss.stores.scheme
 }
 
 func (ss *SqlSupplier) Group() store.GroupStore {
-	return ss.oldStores.group
+	return ss.stores.group
 }
 
 func (ss *SqlSupplier) LinkMetadata() store.LinkMetadataStore {
-	return ss.oldStores.linkMetadata
+	return ss.stores.linkMetadata
 }
 
 func (ss *SqlSupplier) DropAllTables() {
@@ -1064,6 +1177,18 @@ func (ss *SqlSupplier) getQueryBuilder() sq.StatementBuilderType {
 		builder = builder.PlaceholderFormat(sq.Dollar)
 	}
 	return builder
+}
+
+func (ss *SqlSupplier) CheckIntegrity() <-chan store.IntegrityCheckResult {
+	results := make(chan store.IntegrityCheckResult)
+	go CheckRelationalIntegrity(ss, results)
+	return results
+}
+
+func (ss *SqlSupplier) UpdateLicense(license *model.License) {
+	ss.licenseMutex.Lock()
+	defer ss.licenseMutex.Unlock()
+	ss.license = license
 }
 
 type mattermConverter struct{}

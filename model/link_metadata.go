@@ -1,5 +1,5 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// See LICENSE.txt for license information.
 
 package model
 
@@ -56,9 +56,7 @@ func firstNImages(images []*opengraph.Image, maxImages int) []*opengraph.Image {
 	}
 	numImages := len(images)
 	if numImages > maxImages {
-		subImages := make([]*opengraph.Image, maxImages)
-		subImages = images[0:maxImages]
-		return subImages
+		return images[0:maxImages]
 	}
 	return images
 }

@@ -1,15 +1,14 @@
-// Copyright (c) 2017-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
 
 package jobs
 
 import (
-	"fmt"
 	"math/rand"
 	"time"
 
-	"github.com/mattermost/mattermost-server/mlog"
-	"github.com/mattermost/mattermost-server/model"
+	"github.com/mattermost/mattermost-server/v5/mlog"
+	"github.com/mattermost/mattermost-server/v5/model"
 )
 
 // Default polling interval for jobs termination.
@@ -68,7 +67,7 @@ func (watcher *Watcher) Stop() {
 func (watcher *Watcher) PollAndNotify() {
 	jobs, err := watcher.srv.Store.Job().GetAllByStatus(model.JOB_STATUS_PENDING)
 	if err != nil {
-		mlog.Error(fmt.Sprintf("Error occurred getting all pending statuses: %v", err.Error()))
+		mlog.Error("Error occurred getting all pending statuses.", mlog.Err(err))
 		return
 	}
 
@@ -98,6 +97,13 @@ func (watcher *Watcher) PollAndNotify() {
 			if watcher.workers.ElasticsearchAggregation != nil {
 				select {
 				case watcher.workers.ElasticsearchAggregation.JobChannel() <- *job:
+				default:
+				}
+			}
+		} else if job.Type == model.JOB_TYPE_BLEVE_POST_INDEXING {
+			if watcher.workers.BleveIndexing != nil {
+				select {
+				case watcher.workers.BleveIndexing.JobChannel() <- *job:
 				default:
 				}
 			}

@@ -1,5 +1,5 @@
-// Copyright (c) 2016-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
 
 package app
 
@@ -8,7 +8,7 @@ import (
 
 	goi18n "github.com/mattermost/go-i18n/i18n"
 
-	"github.com/mattermost/mattermost-server/model"
+	"github.com/mattermost/mattermost-server/v5/model"
 )
 
 type JoinProvider struct {
@@ -43,7 +43,7 @@ func (me *JoinProvider) DoCommand(a *App, args *model.CommandArgs, message strin
 		channelName = message[1:]
 	}
 
-	channel, err := a.Srv.Store.Channel().GetByName(args.TeamId, channelName, true)
+	channel, err := a.Srv().Store.Channel().GetByName(args.TeamId, channelName, true)
 	if err != nil {
 		return &model.CommandResponse{Text: args.T("api.command_join.list.app_error"), ResponseType: model.COMMAND_RESPONSE_TYPE_EPHEMERAL}
 	}

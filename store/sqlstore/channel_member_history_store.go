@@ -1,24 +1,23 @@
-// Copyright (c) 2017-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
 
 package sqlstore
 
 import (
-	"fmt"
-	"net/http"
-
 	"database/sql"
 
-	"github.com/mattermost/mattermost-server/mlog"
-	"github.com/mattermost/mattermost-server/model"
-	"github.com/mattermost/mattermost-server/store"
+	"github.com/mattermost/mattermost-server/v5/mlog"
+	"github.com/mattermost/mattermost-server/v5/model"
+	"github.com/mattermost/mattermost-server/v5/store"
+
+	"github.com/pkg/errors"
 )
 
 type SqlChannelMemberHistoryStore struct {
 	SqlStore
 }
 
-func NewSqlChannelMemberHistoryStore(sqlStore SqlStore) store.ChannelMemberHistoryStore {
+func newSqlChannelMemberHistoryStore(sqlStore SqlStore) store.ChannelMemberHistoryStore {
 	s := &SqlChannelMemberHistoryStore{
 		SqlStore: sqlStore,
 	}
@@ -33,7 +32,7 @@ func NewSqlChannelMemberHistoryStore(sqlStore SqlStore) store.ChannelMemberHisto
 	return s
 }
 
-func (s SqlChannelMemberHistoryStore) LogJoinEvent(userId string, channelId string, joinTime int64) *model.AppError {
+func (s SqlChannelMemberHistoryStore) LogJoinEvent(userId string, channelId string, joinTime int64) error {
 	channelMemberHistory := &model.ChannelMemberHistory{
 		UserId:    userId,
 		ChannelId: channelId,
@@ -41,12 +40,12 @@ func (s SqlChannelMemberHistoryStore) LogJoinEvent(userId string, channelId stri
 	}
 
 	if err := s.GetMaster().Insert(channelMemberHistory); err != nil {
-		return model.NewAppError("SqlChannelMemberHistoryStore.LogJoinEvent", "store.sql_channel_member_history.log_join_event.app_error", nil, err.Error(), http.StatusInternalServerError)
+		return errors.Wrapf(err, "LogJoinEvent userId=%s channelId=%s joinTime=%d", userId, channelId, joinTime)
 	}
 	return nil
 }
 
-func (s SqlChannelMemberHistoryStore) LogLeaveEvent(userId string, channelId string, leaveTime int64) *model.AppError {
+func (s SqlChannelMemberHistoryStore) LogLeaveEvent(userId string, channelId string, leaveTime int64) error {
 	query := `
 		UPDATE ChannelMemberHistory
 		SET LeaveTime = :LeaveTime
@@ -57,20 +56,20 @@ func (s SqlChannelMemberHistoryStore) LogLeaveEvent(userId string, channelId str
 	params := map[string]interface{}{"UserId": userId, "ChannelId": channelId, "LeaveTime": leaveTime}
 	sqlResult, err := s.GetMaster().Exec(query, params)
 	if err != nil {
-		return model.NewAppError("SqlChannelMemberHistoryStore.LogLeaveEvent", "store.sql_channel_member_history.log_leave_event.update_error", params, err.Error(), http.StatusInternalServerError)
+		return errors.Wrapf(err, "LogLeaveEvent userId=%s channelId=%s leaveTime=%d", userId, channelId, leaveTime)
 	}
 
 	if rows, err := sqlResult.RowsAffected(); err == nil && rows != 1 {
 		// there was no join event to update - this is best effort, so no need to raise an error
-		mlog.Warn(fmt.Sprintf("Channel join event for user %v and channel %v not found", userId, channelId), mlog.String("user_id", userId))
+		mlog.Warn("Channel join event for user and channel not found", mlog.String("user", userId), mlog.String("channel", channelId))
 	}
 	return nil
 }
 
-func (s SqlChannelMemberHistoryStore) GetUsersInChannelDuring(startTime int64, endTime int64, channelId string) ([]*model.ChannelMemberHistoryResult, *model.AppError) {
+func (s SqlChannelMemberHistoryStore) GetUsersInChannelDuring(startTime int64, endTime int64, channelId string) ([]*model.ChannelMemberHistoryResult, error) {
 	useChannelMemberHistory, err := s.hasDataAtOrBefore(startTime)
 	if err != nil {
-		return nil, model.NewAppError("SqlChannelMemberHistoryStore.GetUsersInChannelAt", "store.sql_channel_member_history.get_users_in_channel_during.app_error", nil, err.Error(), http.StatusInternalServerError)
+		return nil, errors.Wrapf(err, "hasDataAtOrBefore startTime=%d endTime=%d channelId=%s", startTime, endTime, channelId)
 	}
 
 	if useChannelMemberHistory {
@@ -78,7 +77,7 @@ func (s SqlChannelMemberHistoryStore) GetUsersInChannelDuring(startTime int64, e
 		// data from it for our export
 		channelMemberHistories, err2 := s.getFromChannelMemberHistoryTable(startTime, endTime, channelId)
 		if err2 != nil {
-			return nil, model.NewAppError("SqlChannelMemberHistoryStore.GetUsersInChannelAt", "store.sql_channel_member_history.get_users_in_channel_during.app_error", nil, err2.Error(), http.StatusInternalServerError)
+			return nil, errors.Wrapf(err2, "getFromChannelMemberHistoryTable startTime=%d endTime=%d channelId=%s", startTime, endTime, channelId)
 		}
 		return channelMemberHistories, nil
 	}
@@ -88,7 +87,7 @@ func (s SqlChannelMemberHistoryStore) GetUsersInChannelDuring(startTime int64, e
 	// this may not always be true, but it's better than saying that somebody wasn't there when they were
 	channelMemberHistories, err := s.getFromChannelMembersTable(startTime, endTime, channelId)
 	if err != nil {
-		return nil, model.NewAppError("SqlChannelMemberHistoryStore.GetUsersInChannelAt", "store.sql_channel_member_history.get_users_in_channel_during.app_error", nil, err.Error(), http.StatusInternalServerError)
+		return nil, errors.Wrapf(err, "getFromChannelMembersTable startTime=%d endTime=%d channelId=%s", startTime, endTime, channelId)
 	}
 	return channelMemberHistories, nil
 }
@@ -128,9 +127,9 @@ func (s SqlChannelMemberHistoryStore) getFromChannelMemberHistoryTable(startTime
 	var histories []*model.ChannelMemberHistoryResult
 	if _, err := s.GetReplica().Select(&histories, query, params); err != nil {
 		return nil, err
-	} else {
-		return histories, nil
 	}
+
+	return histories, nil
 }
 
 func (s SqlChannelMemberHistoryStore) getFromChannelMembersTable(startTime int64, endTime int64, channelId string) ([]*model.ChannelMemberHistoryResult, error) {
@@ -151,17 +150,16 @@ func (s SqlChannelMemberHistoryStore) getFromChannelMembersTable(startTime int64
 	var histories []*model.ChannelMemberHistoryResult
 	if _, err := s.GetReplica().Select(&histories, query, params); err != nil {
 		return nil, err
-	} else {
-		// we have to fill in the join/leave times, because that data doesn't exist in the channel members table
-		for _, channelMemberHistory := range histories {
-			channelMemberHistory.JoinTime = startTime
-			channelMemberHistory.LeaveTime = model.NewInt64(endTime)
-		}
-		return histories, nil
 	}
+	// we have to fill in the join/leave times, because that data doesn't exist in the channel members table
+	for _, channelMemberHistory := range histories {
+		channelMemberHistory.JoinTime = startTime
+		channelMemberHistory.LeaveTime = model.NewInt64(endTime)
+	}
+	return histories, nil
 }
 
-func (s SqlChannelMemberHistoryStore) PermanentDeleteBatch(endTime int64, limit int64) (int64, *model.AppError) {
+func (s SqlChannelMemberHistoryStore) PermanentDeleteBatch(endTime int64, limit int64) (int64, error) {
 	var query string
 	if s.DriverName() == model.DATABASE_DRIVER_POSTGRES {
 		query =
@@ -183,12 +181,12 @@ func (s SqlChannelMemberHistoryStore) PermanentDeleteBatch(endTime int64, limit 
 	params := map[string]interface{}{"EndTime": endTime, "Limit": limit}
 	sqlResult, err := s.GetMaster().Exec(query, params)
 	if err != nil {
-		return int64(0), model.NewAppError("SqlChannelMemberHistoryStore.PermanentDeleteBatchForChannel", "store.sql_channel_member_history.permanent_delete_batch.app_error", params, err.Error(), http.StatusInternalServerError)
+		return 0, errors.Wrapf(err, "PermanentDeleteBatch endTime=%d limit=%d", endTime, limit)
 	}
 
 	rowsAffected, err := sqlResult.RowsAffected()
 	if err != nil {
-		return int64(0), model.NewAppError("SqlChannelMemberHistoryStore.PermanentDeleteBatchForChannel", "store.sql_channel_member_history.permanent_delete_batch.app_error", params, err.Error(), http.StatusInternalServerError)
+		return 0, errors.Wrapf(err, "PermanentDeleteBatch endTime=%d limit=%d", endTime, limit)
 	}
 	return rowsAffected, nil
 }

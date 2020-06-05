@@ -1,5 +1,5 @@
-// Copyright (c) 2017-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
 
 package app
 
@@ -10,10 +10,10 @@ import (
 	"time"
 
 	"github.com/avct/uasurfer"
-	"github.com/mattermost/mattermost-server/model"
-	"github.com/mattermost/mattermost-server/plugin"
-	"github.com/mattermost/mattermost-server/store"
-	"github.com/mattermost/mattermost-server/utils"
+	"github.com/mattermost/mattermost-server/v5/model"
+	"github.com/mattermost/mattermost-server/v5/plugin"
+	"github.com/mattermost/mattermost-server/v5/store"
+	"github.com/mattermost/mattermost-server/v5/utils"
 )
 
 func (a *App) CheckForClientSideCert(r *http.Request) (string, string, string) {
@@ -36,11 +36,11 @@ func (a *App) CheckForClientSideCert(r *http.Request) (string, string, string) {
 func (a *App) AuthenticateUserForLogin(id, loginId, password, mfaToken string, ldapOnly bool) (user *model.User, err *model.AppError) {
 	// Do statistics
 	defer func() {
-		if a.Metrics != nil {
+		if a.Metrics() != nil {
 			if user == nil || err != nil {
-				a.Metrics.IncrementLoginFail()
+				a.Metrics().IncrementLoginFail()
 			} else {
-				a.Metrics.IncrementLogin()
+				a.Metrics().IncrementLogin()
 			}
 		}
 	}()
@@ -93,13 +93,13 @@ func (a *App) GetUserForLogin(id, loginId string) (*model.User, *model.AppError)
 	}
 
 	// Try to get the user by username/email
-	if user, err := a.Srv.Store.User().GetForLogin(loginId, enableUsername, enableEmail); err == nil {
+	if user, err := a.Srv().Store.User().GetForLogin(loginId, enableUsername, enableEmail); err == nil {
 		return user, nil
 	}
 
 	// Try to get the user with LDAP if enabled
-	if *a.Config().LdapSettings.Enable && a.Ldap != nil {
-		if ldapUser, err := a.Ldap.GetUser(loginId); err == nil {
+	if *a.Config().LdapSettings.Enable && a.Ldap() != nil {
+		if ldapUser, err := a.Ldap().GetUser(loginId); err == nil {
 			if user, err := a.GetUserByAuth(ldapUser.AuthData, model.USER_AUTH_SERVICE_LDAP); err == nil {
 				return user, nil
 			}
@@ -110,7 +110,7 @@ func (a *App) GetUserForLogin(id, loginId string) (*model.User, *model.AppError)
 	return nil, model.NewAppError("GetUserForLogin", "store.sql_user.get_for_login.app_error", nil, "", http.StatusBadRequest)
 }
 
-func (a *App) DoLogin(w http.ResponseWriter, r *http.Request, user *model.User, deviceId string) (*model.Session, *model.AppError) {
+func (a *App) DoLogin(w http.ResponseWriter, r *http.Request, user *model.User, deviceId string) *model.AppError {
 	if pluginsEnvironment := a.GetPluginsEnvironment(); pluginsEnvironment != nil {
 		var rejectionReason string
 		pluginContext := a.PluginContext()
@@ -120,7 +120,7 @@ func (a *App) DoLogin(w http.ResponseWriter, r *http.Request, user *model.User, 
 		}, plugin.UserWillLogInId)
 
 		if rejectionReason != "" {
-			return nil, model.NewAppError("DoLogin", "Login rejected by plugin: "+rejectionReason, nil, "", http.StatusBadRequest)
+			return model.NewAppError("DoLogin", "Login rejected by plugin: "+rejectionReason, nil, "", http.StatusBadRequest)
 		}
 	}
 
@@ -133,7 +133,7 @@ func (a *App) DoLogin(w http.ResponseWriter, r *http.Request, user *model.User, 
 		// A special case where we logout of all other sessions with the same Id
 		if err := a.RevokeSessionsForDeviceId(user.Id, deviceId, ""); err != nil {
 			err.StatusCode = http.StatusInternalServerError
-			return nil, err
+			return err
 		}
 	} else {
 		session.SetExpireInDays(*a.Config().ServiceSettings.SessionLengthWebInDays)
@@ -158,13 +158,21 @@ func (a *App) DoLogin(w http.ResponseWriter, r *http.Request, user *model.User, 
 	var err *model.AppError
 	if session, err = a.CreateSession(session); err != nil {
 		err.StatusCode = http.StatusInternalServerError
-		return nil, err
+		return err
 	}
 
 	w.Header().Set(model.HEADER_TOKEN, session.Token)
 
+	a.SetSession(session)
+
+	if user.AuthService == model.USER_AUTH_SERVICE_LDAP && a.Ldap() != nil {
+		a.Srv().Go(func() {
+			a.Ldap().UpdateProfilePictureIfNecessary(user, session)
+		})
+	}
+
 	if pluginsEnvironment := a.GetPluginsEnvironment(); pluginsEnvironment != nil {
-		a.Srv.Go(func() {
+		a.Srv().Go(func() {
 			pluginContext := a.PluginContext()
 			pluginsEnvironment.RunMultiPluginHook(func(hooks plugin.Hooks) bool {
 				hooks.UserHasLoggedIn(pluginContext, user)
@@ -173,10 +181,10 @@ func (a *App) DoLogin(w http.ResponseWriter, r *http.Request, user *model.User, 
 		})
 	}
 
-	return session, nil
+	return nil
 }
 
-func (a *App) AttachSessionCookies(w http.ResponseWriter, r *http.Request, session *model.Session) {
+func (a *App) AttachSessionCookies(w http.ResponseWriter, r *http.Request) {
 	secure := false
 	if GetProtocol(r) == "https" {
 		secure = true
@@ -189,7 +197,7 @@ func (a *App) AttachSessionCookies(w http.ResponseWriter, r *http.Request, sessi
 	expiresAt := time.Unix(model.GetMillis()/1000+int64(maxAge), 0)
 	sessionCookie := &http.Cookie{
 		Name:     model.SESSION_COOKIE_TOKEN,
-		Value:    session.Token,
+		Value:    a.Session().Token,
 		Path:     subpath,
 		MaxAge:   maxAge,
 		Expires:  expiresAt,
@@ -200,7 +208,7 @@ func (a *App) AttachSessionCookies(w http.ResponseWriter, r *http.Request, sessi
 
 	userCookie := &http.Cookie{
 		Name:    model.SESSION_COOKIE_USER,
-		Value:   session.UserId,
+		Value:   a.Session().UserId,
 		Path:    subpath,
 		MaxAge:  maxAge,
 		Expires: expiresAt,
@@ -210,7 +218,7 @@ func (a *App) AttachSessionCookies(w http.ResponseWriter, r *http.Request, sessi
 
 	csrfCookie := &http.Cookie{
 		Name:    model.SESSION_COOKIE_CSRF,
-		Value:   session.GetCSRF(),
+		Value:   a.Session().GetCSRF(),
 		Path:    subpath,
 		MaxAge:  maxAge,
 		Expires: expiresAt,

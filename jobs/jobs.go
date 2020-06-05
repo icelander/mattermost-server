@@ -1,17 +1,16 @@
-// Copyright (c) 2017-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
 
 package jobs
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"net/http"
 
-	"github.com/mattermost/mattermost-server/mlog"
-	"github.com/mattermost/mattermost-server/model"
+	"github.com/mattermost/mattermost-server/v5/mlog"
+	"github.com/mattermost/mattermost-server/v5/model"
 )
 
 const (
@@ -51,6 +50,13 @@ func (srv *JobServer) SetJobProgress(job *model.Job, progress int64) *model.AppE
 	job.Progress = progress
 
 	if _, err := srv.Store.Job().UpdateOptimistically(job, model.JOB_STATUS_IN_PROGRESS); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (srv *JobServer) SetJobWarning(job *model.Job) *model.AppError {
+	if _, err := srv.Store.Job().UpdateStatus(job.Id, model.JOB_STATUS_WARNING); err != nil {
 		return err
 	}
 	return nil
@@ -135,10 +141,10 @@ func (srv *JobServer) CancellationWatcher(ctx context.Context, jobId string, can
 	for {
 		select {
 		case <-ctx.Done():
-			mlog.Debug(fmt.Sprintf("CancellationWatcher for Job: %v Aborting as job has finished.", jobId))
+			mlog.Debug("CancellationWatcher for Job Aborting as job has finished.", mlog.String("job_id", jobId))
 			return
 		case <-time.After(CANCEL_WATCHER_POLLING_INTERVAL * time.Millisecond):
-			mlog.Debug(fmt.Sprintf("CancellationWatcher for Job: %v polling.", jobId))
+			mlog.Debug("CancellationWatcher for Job started polling.", mlog.String("job_id", jobId))
 			if jobStatus, err := srv.Store.Job().Get(jobId); err == nil {
 				if jobStatus.Status == model.JOB_STATUS_CANCEL_REQUESTED {
 					close(cancelChan)

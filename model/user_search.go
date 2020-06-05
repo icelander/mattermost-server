@@ -1,5 +1,5 @@
-// Copyright (c) 2016-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
 
 package model
 
@@ -33,14 +33,14 @@ func (u *UserSearch) ToJson() []byte {
 
 // UserSearchFromJson will decode the input and return a User
 func UserSearchFromJson(data io.Reader) *UserSearch {
-	var us *UserSearch
+	us := UserSearch{}
 	json.NewDecoder(data).Decode(&us)
 
 	if us.Limit == 0 {
 		us.Limit = USER_SEARCH_DEFAULT_LIMIT
 	}
 
-	return us
+	return &us
 }
 
 // UserSearchOptions captures internal parameters derived from the user's permissions and a
@@ -62,4 +62,6 @@ type UserSearchOptions struct {
 	Role string
 	// Restrict to search in a list of teams and channels
 	ViewRestrictions *ViewUsersRestrictions
+	// List of allowed channels
+	ListOfAllowedChannels []string
 }

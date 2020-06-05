@@ -1,16 +1,15 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// See LICENSE.txt for license information.
 
 package sqlstore
 
 import (
-	"fmt"
 	"net/http"
 	"time"
 
-	"github.com/mattermost/mattermost-server/mlog"
-	"github.com/mattermost/mattermost-server/model"
-	"github.com/mattermost/mattermost-server/store"
+	"github.com/mattermost/mattermost-server/v5/mlog"
+	"github.com/mattermost/mattermost-server/v5/model"
+	"github.com/mattermost/mattermost-server/v5/store"
 )
 
 const (
@@ -21,7 +20,7 @@ type SqlSessionStore struct {
 	SqlStore
 }
 
-func NewSqlSessionStore(sqlStore SqlStore) store.SessionStore {
+func newSqlSessionStore(sqlStore SqlStore) store.SessionStore {
 	us := &SqlSessionStore{sqlStore}
 
 	for _, db := range sqlStore.GetAllConns() {
@@ -37,7 +36,7 @@ func NewSqlSessionStore(sqlStore SqlStore) store.SessionStore {
 	return us
 }
 
-func (me SqlSessionStore) CreateIndexesIfNotExists() {
+func (me SqlSessionStore) createIndexesIfNotExists() {
 	me.CreateIndexIfNotExists("idx_sessions_user_id", "Sessions", "UserId")
 	me.CreateIndexIfNotExists("idx_sessions_token", "Sessions", "Token")
 	me.CreateIndexIfNotExists("idx_sessions_expires_at", "Sessions", "ExpiresAt")
@@ -49,29 +48,19 @@ func (me SqlSessionStore) Save(session *model.Session) (*model.Session, *model.A
 	if len(session.Id) > 0 {
 		return nil, model.NewAppError("SqlSessionStore.Save", "store.sql_session.save.existing.app_error", nil, "id="+session.Id, http.StatusBadRequest)
 	}
-
 	session.PreSave()
-
-	tcs := make(chan store.StoreResult, 1)
-	go func() {
-		teams, err := me.Team().GetTeamsForUser(session.UserId)
-		tcs <- store.StoreResult{Data: teams, Err: err}
-		close(tcs)
-	}()
 
 	if err := me.GetMaster().Insert(session); err != nil {
 		return nil, model.NewAppError("SqlSessionStore.Save", "store.sql_session.save.app_error", nil, "id="+session.Id+", "+err.Error(), http.StatusInternalServerError)
 	}
 
-	rtcs := <-tcs
-
-	if rtcs.Err != nil {
-		return nil, model.NewAppError("SqlSessionStore.Save", "store.sql_session.save.app_error", nil, "id="+session.Id+", "+rtcs.Err.Error(), http.StatusInternalServerError)
+	teamMembers, err := me.Team().GetTeamsForUser(session.UserId)
+	if err != nil {
+		return nil, model.NewAppError("SqlSessionStore.Save", "store.sql_session.save.app_error", nil, "id="+session.Id+", "+err.Error(), http.StatusInternalServerError)
 	}
 
-	tempMembers := rtcs.Data.([]*model.TeamMember)
-	session.TeamMembers = make([]*model.TeamMember, 0, len(tempMembers))
-	for _, tm := range tempMembers {
+	session.TeamMembers = make([]*model.TeamMember, 0, len(teamMembers))
+	for _, tm := range teamMembers {
 		if tm.DeleteAt == 0 {
 			session.TeamMembers = append(session.TeamMembers, tm)
 		}
@@ -106,25 +95,18 @@ func (me SqlSessionStore) Get(sessionIdOrToken string) (*model.Session, *model.A
 func (me SqlSessionStore) GetSessions(userId string) ([]*model.Session, *model.AppError) {
 	var sessions []*model.Session
 
-	tcs := make(chan store.StoreResult, 1)
-	go func() {
-		teams, err := me.Team().GetTeamsForUser(userId)
-		tcs <- store.StoreResult{Data: teams, Err: err}
-		close(tcs)
-	}()
 	if _, err := me.GetReplica().Select(&sessions, "SELECT * FROM Sessions WHERE UserId = :UserId ORDER BY LastActivityAt DESC", map[string]interface{}{"UserId": userId}); err != nil {
 		return nil, model.NewAppError("SqlSessionStore.GetSessions", "store.sql_session.get_sessions.app_error", nil, err.Error(), http.StatusInternalServerError)
 	}
 
-	rtcs := <-tcs
-	if rtcs.Err != nil {
-		return nil, model.NewAppError("SqlSessionStore.GetSessions", "store.sql_session.get_sessions.app_error", nil, rtcs.Err.Error(), http.StatusInternalServerError)
+	teamMembers, err := me.Team().GetTeamsForUser(userId)
+	if err != nil {
+		return nil, model.NewAppError("SqlSessionStore.GetSessions", "store.sql_session.get_sessions.app_error", nil, err.Error(), http.StatusInternalServerError)
 	}
 
 	for _, session := range sessions {
-		tempMembers := rtcs.Data.([]*model.TeamMember)
-		session.TeamMembers = make([]*model.TeamMember, 0, len(tempMembers))
-		for _, tm := range tempMembers {
+		session.TeamMembers = make([]*model.TeamMember, 0, len(teamMembers))
+		for _, tm := range teamMembers {
 			if tm.DeleteAt == 0 {
 				session.TeamMembers = append(session.TeamMembers, tm)
 			}
@@ -175,6 +157,14 @@ func (me SqlSessionStore) PermanentDeleteSessionsByUser(userId string) *model.Ap
 		return model.NewAppError("SqlSessionStore.RemoveAllSessionsForUser", "store.sql_session.permanent_delete_sessions_by_user.app_error", nil, "id="+userId+", err="+err.Error(), http.StatusInternalServerError)
 	}
 
+	return nil
+}
+
+func (me SqlSessionStore) UpdateExpiresAt(sessionId string, time int64) *model.AppError {
+	_, err := me.GetMaster().Exec("UPDATE Sessions SET ExpiresAt = :ExpiresAt WHERE Id = :Id", map[string]interface{}{"ExpiresAt": time, "Id": sessionId})
+	if err != nil {
+		return model.NewAppError("SqlSessionStore.UpdateExpiresAt", "store.sql_session.update_expires_at.app_error", nil, "sessionId="+sessionId, http.StatusInternalServerError)
+	}
 	return nil
 }
 
@@ -251,13 +241,13 @@ func (me SqlSessionStore) Cleanup(expiryTime int64, batchSize int64) {
 
 	for rowsAffected > 0 {
 		if sqlResult, err := me.GetMaster().Exec(query, map[string]interface{}{"ExpiresAt": expiryTime, "Limit": batchSize}); err != nil {
-			mlog.Error(fmt.Sprintf("Unable to cleanup session store. err=%v", err.Error()))
+			mlog.Error("Unable to cleanup session store.", mlog.Err(err))
 			return
 		} else {
 			var rowErr error
 			rowsAffected, rowErr = sqlResult.RowsAffected()
 			if rowErr != nil {
-				mlog.Error(fmt.Sprintf("Unable to cleanup session store. err=%v", err.Error()))
+				mlog.Error("Unable to cleanup session store.", mlog.Err(err))
 				return
 			}
 		}

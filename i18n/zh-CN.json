@@ -5179,10 +5179,6 @@
     "translation": "已达到分页限制"
   },
   {
-    "id": "store.sql_audit.permanent_delete_batch.app_error",
-    "translation": "批量永久删除审计时遇到错误"
-  },
-  {
     "id": "store.sql_audit.permanent_delete_by_user.app_error",
     "translation": "我们删除审计时遇到了一个错误"
   },
@@ -6021,10 +6017,6 @@
   {
     "id": "store.sql_post.permanent_delete_by_user.too_many.app_error",
     "translation": "无法删除该用户被选择的信息(数量太多)，请重新运行"
-  },
-  {
-    "id": "store.sql_post.query_max_post_size.error",
-    "translation": "无法判断最大支持的消息大小"
   },
   {
     "id": "store.sql_post.save.app_error",

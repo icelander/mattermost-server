@@ -1,5 +1,5 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// See LICENSE.txt for license information.
 
 package model
 
@@ -39,6 +39,13 @@ type Session struct {
 	IsOAuth        bool          `json:"is_oauth"`
 	Props          StringMap     `json:"props"`
 	TeamMembers    []*TeamMember `json:"team_members" db:"-"`
+	Local          bool          `json:"local" db:"-"`
+}
+
+// Returns true if the session is unrestricted, which should grant it
+// with all permissions. This is used for local mode sessions
+func (me *Session) IsUnrestricted() bool {
+	return me.Local
 }
 
 func (me *Session) DeepCopy() *Session {

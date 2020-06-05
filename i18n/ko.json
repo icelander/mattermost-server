@@ -5179,10 +5179,6 @@
     "translation": "Limit exceeded for paging"
   },
   {
-    "id": "store.sql_audit.permanent_delete_batch.app_error",
-    "translation": "We encountered an error permanently deleting the batch of audits"
-  },
-  {
     "id": "store.sql_audit.permanent_delete_by_user.app_error",
     "translation": "We encountered an error deleting the audits"
   },
@@ -6021,10 +6017,6 @@
   {
     "id": "store.sql_post.permanent_delete_by_user.too_many.app_error",
     "translation": "We couldn't select the posts to delete for the user (too many), please re-run"
-  },
-  {
-    "id": "store.sql_post.query_max_post_size.error",
-    "translation": "Unable to determine the maximum supported post size"
   },
   {
     "id": "store.sql_post.save.app_error",

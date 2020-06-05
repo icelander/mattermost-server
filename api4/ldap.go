@@ -1,5 +1,5 @@
-// Copyright (c) 2017-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
 
 package api4
 
@@ -8,7 +8,8 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/mattermost/mattermost-server/model"
+	"github.com/mattermost/mattermost-server/v5/audit"
+	"github.com/mattermost/mattermost-server/v5/model"
 )
 
 type mixedUnlinkedGroup struct {
@@ -38,13 +39,17 @@ func syncLdap(c *Context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !c.App.SessionHasPermissionTo(c.App.Session, model.PERMISSION_MANAGE_SYSTEM) {
+	auditRec := c.MakeAuditRecord("syncLdap", audit.Fail)
+	defer c.LogAuditRec(auditRec)
+
+	if !c.App.SessionHasPermissionTo(*c.App.Session(), model.PERMISSION_MANAGE_SYSTEM) {
 		c.SetPermissionError(model.PERMISSION_MANAGE_SYSTEM)
 		return
 	}
 
 	c.App.SyncLdap()
 
+	auditRec.Success()
 	ReturnStatusOK(w)
 }
 
@@ -54,7 +59,7 @@ func testLdap(c *Context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !c.App.SessionHasPermissionTo(c.App.Session, model.PERMISSION_MANAGE_SYSTEM) {
+	if !c.App.SessionHasPermissionTo(*c.App.Session(), model.PERMISSION_MANAGE_SYSTEM) {
 		c.SetPermissionError(model.PERMISSION_MANAGE_SYSTEM)
 		return
 	}
@@ -68,7 +73,7 @@ func testLdap(c *Context, w http.ResponseWriter, r *http.Request) {
 }
 
 func getLdapGroups(c *Context, w http.ResponseWriter, r *http.Request) {
-	if !c.App.SessionHasPermissionTo(c.App.Session, model.PERMISSION_MANAGE_SYSTEM) {
+	if !c.App.SessionHasPermissionTo(*c.App.Session(), model.PERMISSION_MANAGE_SYSTEM) {
 		c.SetPermissionError(model.PERMISSION_MANAGE_SYSTEM)
 		return
 	}
@@ -125,10 +130,14 @@ func linkLdapGroup(c *Context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !c.App.SessionHasPermissionTo(c.App.Session, model.PERMISSION_MANAGE_SYSTEM) {
+	if !c.App.SessionHasPermissionTo(*c.App.Session(), model.PERMISSION_MANAGE_SYSTEM) {
 		c.SetPermissionError(model.PERMISSION_MANAGE_SYSTEM)
 		return
 	}
+
+	auditRec := c.MakeAuditRecord("linkLdapGroup", audit.Fail)
+	defer c.LogAuditRec(auditRec)
+	auditRec.AddMeta("remote_id", c.Params.RemoteId)
 
 	if c.App.License() == nil || !*c.App.License().Features.LDAPGroups {
 		c.Err = model.NewAppError("Api4.linkLdapGroup", "api.ldap_groups.license_error", nil, "", http.StatusNotImplemented)
@@ -140,6 +149,7 @@ func linkLdapGroup(c *Context, w http.ResponseWriter, r *http.Request) {
 		c.Err = err
 		return
 	}
+	auditRec.AddMeta("ldap_group", ldapGroup)
 
 	if ldapGroup == nil {
 		c.Err = model.NewAppError("Api4.linkLdapGroup", "api.ldap_group.not_found", nil, "", http.StatusNotFound)
@@ -151,9 +161,20 @@ func linkLdapGroup(c *Context, w http.ResponseWriter, r *http.Request) {
 		c.Err = err
 		return
 	}
+	if group != nil {
+		auditRec.AddMeta("group", group)
+	}
 
 	var status int
 	var newOrUpdatedGroup *model.Group
+
+	// Truncate display name if necessary
+	var displayName string
+	if len(ldapGroup.DisplayName) > model.GroupDisplayNameMaxLength {
+		displayName = ldapGroup.DisplayName[:model.GroupDisplayNameMaxLength]
+	} else {
+		displayName = ldapGroup.DisplayName
+	}
 
 	// Group has been previously linked
 	if group != nil {
@@ -161,7 +182,7 @@ func linkLdapGroup(c *Context, w http.ResponseWriter, r *http.Request) {
 			newOrUpdatedGroup = group
 		} else {
 			group.DeleteAt = 0
-			group.DisplayName = ldapGroup.DisplayName
+			group.DisplayName = displayName
 			group.RemoteId = ldapGroup.RemoteId
 			newOrUpdatedGroup, err = c.App.UpdateGroup(group)
 			if err != nil {
@@ -173,12 +194,10 @@ func linkLdapGroup(c *Context, w http.ResponseWriter, r *http.Request) {
 	} else {
 		// Group has never been linked
 		//
-		// TODO: In a future phase of LDAP groups sync `Name` will be used for at-mentions and will be editable on
-		// the front-end so it will not have an initial value of `model.NewId()` but rather a slugified version of
-		// the LDAP group name with an appended duplicate-breaker.
+		// For group mentions implementation, the Name column will no longer be set by default.
+		// Instead it will be set and saved in the web app when Group Mentions is enabled.
 		newGroup := &model.Group{
-			Name:        model.NewId(),
-			DisplayName: ldapGroup.DisplayName,
+			DisplayName: displayName,
 			RemoteId:    ldapGroup.RemoteId,
 			Source:      model.GroupSourceLdap,
 		}
@@ -196,6 +215,8 @@ func linkLdapGroup(c *Context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	auditRec.Success()
+
 	w.WriteHeader(status)
 	w.Write(b)
 }
@@ -206,7 +227,11 @@ func unlinkLdapGroup(c *Context, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !c.App.SessionHasPermissionTo(c.App.Session, model.PERMISSION_MANAGE_SYSTEM) {
+	auditRec := c.MakeAuditRecord("unlinkLdapGroup", audit.Fail)
+	defer c.LogAuditRec(auditRec)
+	auditRec.AddMeta("remote_id", c.Params.RemoteId)
+
+	if !c.App.SessionHasPermissionTo(*c.App.Session(), model.PERMISSION_MANAGE_SYSTEM) {
 		c.SetPermissionError(model.PERMISSION_MANAGE_SYSTEM)
 		return
 	}
@@ -221,6 +246,7 @@ func unlinkLdapGroup(c *Context, w http.ResponseWriter, r *http.Request) {
 		c.Err = err
 		return
 	}
+	auditRec.AddMeta("group", group)
 
 	if group.DeleteAt == 0 {
 		_, err = c.App.DeleteGroup(group.Id)
@@ -230,5 +256,6 @@ func unlinkLdapGroup(c *Context, w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	auditRec.Success()
 	ReturnStatusOK(w)
 }

@@ -1,20 +1,22 @@
-// Copyright (c) 2016-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
 
 package sqlstore
 
 import (
 	"net/http"
 
-	"github.com/mattermost/mattermost-server/model"
-	"github.com/mattermost/mattermost-server/store"
+	sq "github.com/Masterminds/squirrel"
+
+	"github.com/mattermost/mattermost-server/v5/model"
+	"github.com/mattermost/mattermost-server/v5/store"
 )
 
 type SqlAuditStore struct {
 	SqlStore
 }
 
-func NewSqlAuditStore(sqlStore SqlStore) store.AuditStore {
+func newSqlAuditStore(sqlStore SqlStore) store.AuditStore {
 	s := &SqlAuditStore{sqlStore}
 
 	for _, db := range sqlStore.GetAllConns() {
@@ -30,7 +32,7 @@ func NewSqlAuditStore(sqlStore SqlStore) store.AuditStore {
 	return s
 }
 
-func (s SqlAuditStore) CreateIndexesIfNotExists() {
+func (s SqlAuditStore) createIndexesIfNotExists() {
 	s.CreateIndexIfNotExists("idx_audits_user_id", "Audits", "UserId")
 }
 
@@ -49,16 +51,24 @@ func (s SqlAuditStore) Get(user_id string, offset int, limit int) (model.Audits,
 		return nil, model.NewAppError("SqlAuditStore.Get", "store.sql_audit.get.limit.app_error", nil, "user_id="+user_id, http.StatusBadRequest)
 	}
 
-	query := "SELECT * FROM Audits"
+	query := s.getQueryBuilder().
+		Select("*").
+		From("Audits").
+		OrderBy("CreateAt DESC").
+		Limit(uint64(limit)).
+		Offset(uint64(offset))
 
 	if len(user_id) != 0 {
-		query += " WHERE UserId = :user_id"
+		query = query.Where(sq.Eq{"UserId": user_id})
 	}
 
-	query += " ORDER BY CreateAt DESC LIMIT :limit OFFSET :offset"
+	queryString, args, err := query.ToSql()
+	if err != nil {
+		return nil, model.NewAppError("SqlAuditStore.Get", "store.sql_audit.app_error", nil, err.Error(), http.StatusInternalServerError)
+	}
 
 	var audits model.Audits
-	if _, err := s.GetReplica().Select(&audits, query, map[string]interface{}{"user_id": user_id, "limit": limit, "offset": offset}); err != nil {
+	if _, err := s.GetReplica().Select(&audits, queryString, args...); err != nil {
 		return nil, model.NewAppError("SqlAuditStore.Get", "store.sql_audit.get.finding.app_error", nil, "user_id="+user_id, http.StatusInternalServerError)
 	}
 	return audits, nil
@@ -70,24 +80,4 @@ func (s SqlAuditStore) PermanentDeleteByUser(userId string) *model.AppError {
 		return model.NewAppError("SqlAuditStore.Delete", "store.sql_audit.permanent_delete_by_user.app_error", nil, "user_id="+userId, http.StatusInternalServerError)
 	}
 	return nil
-}
-
-func (s SqlAuditStore) PermanentDeleteBatch(endTime int64, limit int64) (int64, *model.AppError) {
-	var query string
-	if s.DriverName() == "postgres" {
-		query = "DELETE from Audits WHERE Id = any (array (SELECT Id FROM Audits WHERE CreateAt < :EndTime LIMIT :Limit))"
-	} else {
-		query = "DELETE from Audits WHERE CreateAt < :EndTime LIMIT :Limit"
-	}
-
-	sqlResult, err := s.GetMaster().Exec(query, map[string]interface{}{"EndTime": endTime, "Limit": limit})
-	if err != nil {
-		return 0, model.NewAppError("SqlAuditStore.PermanentDeleteBatch", "store.sql_audit.permanent_delete_batch.app_error", nil, ""+err.Error(), http.StatusInternalServerError)
-	}
-
-	rowsAffected, err1 := sqlResult.RowsAffected()
-	if err1 != nil {
-		return 0, model.NewAppError("SqlAuditStore.PermanentDeleteBatch", "store.sql_audit.permanent_delete_batch.app_error", nil, ""+err.Error(), http.StatusInternalServerError)
-	}
-	return rowsAffected, nil
 }

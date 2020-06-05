@@ -1,10 +1,12 @@
-// Copyright (c) 2017-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
 
 package app
 
 import (
+	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"time"
 
@@ -12,18 +14,18 @@ import (
 
 	"net/http"
 
-	"github.com/mattermost/mattermost-server/mlog"
-	"github.com/mattermost/mattermost-server/model"
-	"github.com/mattermost/mattermost-server/services/mailservice"
-	"github.com/mattermost/mattermost-server/utils"
+	"github.com/mattermost/mattermost-server/v5/mlog"
+	"github.com/mattermost/mattermost-server/v5/model"
+	"github.com/mattermost/mattermost-server/v5/services/mailservice"
+	"github.com/mattermost/mattermost-server/v5/utils"
 )
 
 func (a *App) GetLogs(page, perPage int) ([]string, *model.AppError) {
 	var lines []string
-	if a.Cluster != nil && *a.Config().ClusterSettings.Enable {
+	if a.Cluster() != nil && *a.Config().ClusterSettings.Enable {
 		lines = append(lines, "-----------------------------------------------------------------------------------------------------------")
 		lines = append(lines, "-----------------------------------------------------------------------------------------------------------")
-		lines = append(lines, a.Cluster.GetMyClusterInfo().Hostname)
+		lines = append(lines, a.Cluster().GetMyClusterInfo().Hostname)
 		lines = append(lines, "-----------------------------------------------------------------------------------------------------------")
 		lines = append(lines, "-----------------------------------------------------------------------------------------------------------")
 	}
@@ -35,8 +37,8 @@ func (a *App) GetLogs(page, perPage int) ([]string, *model.AppError) {
 
 	lines = append(lines, melines...)
 
-	if a.Cluster != nil && *a.Config().ClusterSettings.Enable {
-		clines, err := a.Cluster.GetLogs(page, perPage)
+	if a.Cluster() != nil && *a.Config().ClusterSettings.Enable {
+		clines, err := a.Cluster().GetLogs(page, perPage)
 		if err != nil {
 			return nil, err
 		}
@@ -121,8 +123,8 @@ func (a *App) GetLogsSkipSend(page, perPage int) ([]string, *model.AppError) {
 func (a *App) GetClusterStatus() []*model.ClusterInfo {
 	infos := make([]*model.ClusterInfo, 0)
 
-	if a.Cluster != nil {
-		infos = a.Cluster.GetClusterInfos()
+	if a.Cluster() != nil {
+		infos = a.Cluster().GetClusterInfos()
 	}
 
 	return infos
@@ -132,7 +134,7 @@ func (a *App) InvalidateAllCaches() *model.AppError {
 	debug.FreeOSMemory()
 	a.InvalidateAllCachesSkipSend()
 
-	if a.Cluster != nil {
+	if a.Cluster() != nil {
 
 		msg := &model.ClusterMessage{
 			Event:            model.CLUSTER_EVENT_INVALIDATE_ALL_CACHES,
@@ -140,7 +142,7 @@ func (a *App) InvalidateAllCaches() *model.AppError {
 			WaitForAllToSend: true,
 		}
 
-		a.Cluster.SendClusterMessage(msg)
+		a.Cluster().SendClusterMessage(msg)
 	}
 
 	return nil
@@ -148,30 +150,40 @@ func (a *App) InvalidateAllCaches() *model.AppError {
 
 func (a *App) InvalidateAllCachesSkipSend() {
 	mlog.Info("Purging all caches")
-	a.Srv.sessionCache.Purge()
-	ClearStatusCache()
-	a.Srv.Store.Team().ClearCaches()
-	a.Srv.Store.Channel().ClearCaches()
-	a.Srv.Store.User().ClearCaches()
-	a.Srv.Store.Post().ClearCaches()
-	a.Srv.Store.FileInfo().ClearCaches()
-	a.Srv.Store.Webhook().ClearCaches()
+	a.Srv().sessionCache.Purge()
+	a.Srv().statusCache.Purge()
+	a.Srv().Store.Team().ClearCaches()
+	a.Srv().Store.Channel().ClearCaches()
+	a.Srv().Store.User().ClearCaches()
+	a.Srv().Store.Post().ClearCaches()
+	a.Srv().Store.FileInfo().ClearCaches()
+	a.Srv().Store.Webhook().ClearCaches()
 	a.LoadLicense()
 }
 
 func (a *App) RecycleDatabaseConnection() {
-	oldStore := a.Srv.Store
+	mlog.Info("Attempting to recycle database connections.")
 
-	mlog.Warn("Attempting to recycle the database connection.")
-	a.Srv.Store = a.Srv.newStore()
-	a.Srv.Jobs.Store = a.Srv.Store
+	// This works by setting 10 seconds as the max conn lifetime for all DB connections.
+	// This allows in gradually closing connections as they expire. In future, we can think
+	// of exposing this as a param from the REST api.
+	a.Srv().Store.RecycleDBConnections(10 * time.Second)
 
-	if a.Srv.Store != oldStore {
-		time.Sleep(20 * time.Second)
-		oldStore.Close()
+	mlog.Info("Finished recycling database connections.")
+}
+
+func (a *App) TestSiteURL(siteURL string) *model.AppError {
+	url := fmt.Sprintf("%s/api/v4/system/ping", siteURL)
+	res, err := http.Get(url)
+	if err != nil || res.StatusCode != 200 {
+		return model.NewAppError("testSiteURL", "app.admin.test_site_url.failure", nil, "", http.StatusBadRequest)
 	}
+	defer func() {
+		_, _ = io.Copy(ioutil.Discard, res.Body)
+		_ = res.Body.Close()
+	}()
 
-	mlog.Warn("Finished recycling the database connection.")
+	return nil
 }
 
 func (a *App) TestEmail(userId string, cfg *model.Config) *model.AppError {
@@ -206,4 +218,14 @@ func (a *App) TestEmail(userId string, cfg *model.Config) *model.AppError {
 	}
 
 	return nil
+}
+
+// ServerBusyStateChanged is called when a CLUSTER_EVENT_BUSY_STATE_CHANGED is received.
+func (a *App) ServerBusyStateChanged(sbs *model.ServerBusyState) {
+	a.Srv().Busy.ClusterEventChanged(sbs)
+	if sbs.Busy {
+		mlog.Warn("server busy state activitated via cluster event - non-critical services disabled", mlog.Int64("expires_sec", sbs.Expires))
+	} else {
+		mlog.Info("server busy state cleared via cluster event - non-critical services enabled")
+	}
 }

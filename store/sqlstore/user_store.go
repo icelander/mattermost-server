@@ -1,10 +1,11 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// See LICENSE.txt for license information.
 
 package sqlstore
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"sort"
@@ -14,17 +15,12 @@ import (
 	sq "github.com/Masterminds/squirrel"
 	"github.com/mattermost/gorp"
 
-	"github.com/mattermost/mattermost-server/einterfaces"
-	"github.com/mattermost/mattermost-server/model"
-	"github.com/mattermost/mattermost-server/store"
-	"github.com/mattermost/mattermost-server/utils"
+	"github.com/mattermost/mattermost-server/v5/einterfaces"
+	"github.com/mattermost/mattermost-server/v5/model"
+	"github.com/mattermost/mattermost-server/v5/store"
 )
 
 const (
-	PROFILES_IN_CHANNEL_CACHE_SIZE  = model.CHANNEL_CACHE_SIZE
-	PROFILES_IN_CHANNEL_CACHE_SEC   = 900 // 15 mins
-	PROFILE_BY_IDS_CACHE_SIZE       = model.SESSION_CACHE_SIZE
-	PROFILE_BY_IDS_CACHE_SEC        = 900 // 15 mins
 	MAX_GROUP_CHANNELS_FOR_PROFILES = 50
 )
 
@@ -43,35 +39,20 @@ type SqlUserStore struct {
 	usersQuery sq.SelectBuilder
 }
 
-var profilesInChannelCache *utils.Cache = utils.NewLru(PROFILES_IN_CHANNEL_CACHE_SIZE)
-var profileByIdsCache *utils.Cache = utils.NewLru(PROFILE_BY_IDS_CACHE_SIZE)
+func (us SqlUserStore) ClearCaches() {}
 
-func (us SqlUserStore) ClearCaches() {
-	profilesInChannelCache.Purge()
-	profileByIdsCache.Purge()
+func (us SqlUserStore) InvalidateProfileCacheForUser(userId string) {}
 
-	if us.metrics != nil {
-		us.metrics.IncrementMemCacheInvalidationCounter("Profiles in Channel - Purge")
-		us.metrics.IncrementMemCacheInvalidationCounter("Profile By Ids - Purge")
-	}
-}
-
-func (us SqlUserStore) InvalidatProfileCacheForUser(userId string) {
-	profileByIdsCache.Remove(userId)
-
-	if us.metrics != nil {
-		us.metrics.IncrementMemCacheInvalidationCounter("Profile By Ids - Remove")
-	}
-}
-
-func NewSqlUserStore(sqlStore SqlStore, metrics einterfaces.MetricsInterface) store.UserStore {
+func newSqlUserStore(sqlStore SqlStore, metrics einterfaces.MetricsInterface) store.UserStore {
 	us := &SqlUserStore{
 		SqlStore: sqlStore,
 		metrics:  metrics,
 	}
 
+	// note: we are providing field names explicitly here to maintain order of columns (needed when using raw queries)
 	us.usersQuery = us.getQueryBuilder().
-		Select("u.*", "b.UserId IS NOT NULL AS IsBot", "COALESCE(b.Description, '') AS BotDescription").
+		Select("u.Id", "u.CreateAt", "u.UpdateAt", "u.DeleteAt", "u.Username", "u.Password", "u.AuthData", "u.AuthService", "u.Email", "u.EmailVerified", "u.Nickname", "u.FirstName", "u.LastName", "u.Position", "u.Roles", "u.AllowMarketing", "u.Props", "u.NotifyProps", "u.LastPasswordUpdate", "u.LastPictureUpdate", "u.FailedAttempts", "u.Locale", "u.Timezone", "u.MfaActive", "u.MfaSecret",
+			"b.UserId IS NOT NULL AS IsBot", "COALESCE(b.Description, '') AS BotDescription", "COALESCE(b.LastIconUpdate, 0) AS BotLastIconUpdate").
 		From("Users u").
 		LeftJoin("Bots b ON ( b.UserId = u.Id )")
 
@@ -98,7 +79,7 @@ func NewSqlUserStore(sqlStore SqlStore, metrics einterfaces.MetricsInterface) st
 	return us
 }
 
-func (us SqlUserStore) CreateIndexesIfNotExists() {
+func (us SqlUserStore) createIndexesIfNotExists() {
 	us.CreateIndexIfNotExists("idx_users_email", "Users", "Email")
 	us.CreateIndexIfNotExists("idx_users_update_at", "Users", "UpdateAt")
 	us.CreateIndexIfNotExists("idx_users_create_at", "Users", "CreateAt")
@@ -139,6 +120,40 @@ func (us SqlUserStore) Save(user *model.User) (*model.User, *model.AppError) {
 	}
 
 	return user, nil
+}
+
+func (us SqlUserStore) DeactivateGuests() ([]string, *model.AppError) {
+	curTime := model.GetMillis()
+	updateQuery := us.getQueryBuilder().Update("Users").
+		Set("UpdateAt", curTime).
+		Set("DeleteAt", curTime).
+		Where(sq.Eq{"Roles": "system_guest"}).
+		Where(sq.Eq{"DeleteAt": 0})
+
+	queryString, args, err := updateQuery.ToSql()
+	if err != nil {
+		return nil, model.NewAppError("SqlUserStore.UpdateActiveForMultipleUsers", "store.sql_user.app_error", nil, err.Error(), http.StatusInternalServerError)
+	}
+
+	_, err = us.GetMaster().Exec(queryString, args...)
+	if err != nil {
+		return nil, model.NewAppError("SqlUserStore.UpdateActiveForMultipleUsers", "store.sql_user.update_active_for_multiple_users.updating.app_error", nil, err.Error(), http.StatusInternalServerError)
+	}
+
+	selectQuery := us.getQueryBuilder().Select("Id").From("Users").Where(sq.Eq{"DeleteAt": curTime})
+
+	queryString, args, err = selectQuery.ToSql()
+	if err != nil {
+		return nil, model.NewAppError("SqlUserStore.UpdateActiveForMultipleUsers", "store.sql_user.app_error", nil, err.Error(), http.StatusInternalServerError)
+	}
+
+	userIds := []string{}
+	_, err = us.GetMaster().Select(&userIds, queryString, args...)
+	if err != nil {
+		return nil, model.NewAppError("SqlUserStore.UpdateActiveForMultipleUsers", "store.sql_user.update_active_for_multiple_users.getting_changed_users.app_error", nil, err.Error(), http.StatusInternalServerError)
+	}
+
+	return userIds, nil
 }
 
 func (us SqlUserStore) Update(user *model.User, trustedUpdateData bool) (*model.UserUpdate, *model.AppError) {
@@ -409,10 +424,12 @@ func applyRoleFilter(query sq.SelectBuilder, role string, isPostgreSQL bool) sq.
 		return query
 	}
 
-	roleParam := fmt.Sprintf("%%%s%%", role)
 	if isPostgreSQL {
+		roleParam := fmt.Sprintf("%%%s%%", sanitizeSearchTerm(role, "\\"))
 		return query.Where("u.Roles LIKE LOWER(?)", roleParam)
 	}
+
+	roleParam := fmt.Sprintf("%%%s%%", sanitizeSearchTerm(role, "*"))
 
 	return query.Where("u.Roles LIKE ? ESCAPE '*'", roleParam)
 }
@@ -465,8 +482,8 @@ func applyTeamGroupConstrainedFilter(query sq.SelectBuilder, teamId string) sq.S
 			)`, teamId)
 }
 
-func (s SqlUserStore) GetEtagForProfiles(teamId string) string {
-	updateAt, err := s.GetReplica().SelectInt("SELECT UpdateAt FROM Users, TeamMembers WHERE TeamMembers.TeamId = :TeamId AND Users.Id = TeamMembers.UserId ORDER BY UpdateAt DESC LIMIT 1", map[string]interface{}{"TeamId": teamId})
+func (us SqlUserStore) GetEtagForProfiles(teamId string) string {
+	updateAt, err := us.GetReplica().SelectInt("SELECT UpdateAt FROM Users, TeamMembers WHERE TeamMembers.TeamId = :TeamId AND Users.Id = TeamMembers.UserId ORDER BY UpdateAt DESC LIMIT 1", map[string]interface{}{"TeamId": teamId})
 	if err != nil {
 		return fmt.Sprintf("%v.%v", model.CurrentVersion, model.GetMillis())
 	}
@@ -506,28 +523,9 @@ func (us SqlUserStore) GetProfiles(options *model.UserGetOptions) ([]*model.User
 	return users, nil
 }
 
-func (us SqlUserStore) InvalidateProfilesInChannelCacheByUser(userId string) {
-	keys := profilesInChannelCache.Keys()
+func (us SqlUserStore) InvalidateProfilesInChannelCacheByUser(userId string) {}
 
-	for _, key := range keys {
-		if cacheItem, ok := profilesInChannelCache.Get(key); ok {
-			userMap := cacheItem.(map[string]*model.User)
-			if _, userInCache := userMap[userId]; userInCache {
-				profilesInChannelCache.Remove(key)
-				if us.metrics != nil {
-					us.metrics.IncrementMemCacheInvalidationCounter("Profiles in Channel - Remove by User")
-				}
-			}
-		}
-	}
-}
-
-func (us SqlUserStore) InvalidateProfilesInChannelCache(channelId string) {
-	profilesInChannelCache.Remove(channelId)
-	if us.metrics != nil {
-		us.metrics.IncrementMemCacheInvalidationCounter("Profiles in Channel - Remove by Channel")
-	}
-}
+func (us SqlUserStore) InvalidateProfilesInChannelCache(channelId string) {}
 
 func (us SqlUserStore) GetProfilesInChannel(channelId string, offset int, limit int) ([]*model.User, *model.AppError) {
 	query := us.usersQuery.
@@ -587,23 +585,9 @@ func (us SqlUserStore) GetProfilesInChannelByStatus(channelId string, offset int
 }
 
 func (us SqlUserStore) GetAllProfilesInChannel(channelId string, allowFromCache bool) (map[string]*model.User, *model.AppError) {
-	if allowFromCache {
-		if cacheItem, ok := profilesInChannelCache.Get(channelId); ok {
-			if us.metrics != nil {
-				us.metrics.IncrementMemCacheHitCounter("Profiles in Channel")
-			}
-			return cacheItem.(map[string]*model.User), nil
-		} else {
-			if us.metrics != nil {
-				us.metrics.IncrementMemCacheMissCounter("Profiles in Channel")
-			}
-		}
-	} else {
-		if us.metrics != nil {
-			us.metrics.IncrementMemCacheMissCounter("Profiles in Channel")
-		}
+	failure := func(e error) (map[string]*model.User, *model.AppError) {
+		return nil, model.NewAppError("SqlUserStore.GetAllProfilesInChannel", "store.sql_user.app_error", nil, e.Error(), http.StatusInternalServerError)
 	}
-
 	query := us.usersQuery.
 		Join("ChannelMembers cm ON ( cm.UserId = u.Id )").
 		Where("cm.ChannelId = ?", channelId).
@@ -612,12 +596,35 @@ func (us SqlUserStore) GetAllProfilesInChannel(channelId string, allowFromCache 
 
 	queryString, args, err := query.ToSql()
 	if err != nil {
-		return nil, model.NewAppError("SqlUserStore.GetAllProfilesInChannel", "store.sql_user.app_error", nil, err.Error(), http.StatusInternalServerError)
+		return failure(err)
+	}
+	var users []*model.User
+	rows, err := us.GetReplica().Db.Query(queryString, args...)
+	if err != nil {
+		return failure(err)
 	}
 
-	var users []*model.User
-	if _, err := us.GetReplica().Select(&users, queryString, args...); err != nil {
-		return nil, model.NewAppError("SqlUserStore.GetAllProfilesInChannel", "store.sql_user.get_profiles.app_error", nil, err.Error(), http.StatusInternalServerError)
+	defer rows.Close()
+	for rows.Next() {
+		var user model.User
+		var props, notifyProps, timezone []byte
+		if err = rows.Scan(&user.Id, &user.CreateAt, &user.UpdateAt, &user.DeleteAt, &user.Username, &user.Password, &user.AuthData, &user.AuthService, &user.Email, &user.EmailVerified, &user.Nickname, &user.FirstName, &user.LastName, &user.Position, &user.Roles, &user.AllowMarketing, &props, &notifyProps, &user.LastPasswordUpdate, &user.LastPictureUpdate, &user.FailedAttempts, &user.Locale, &timezone, &user.MfaActive, &user.MfaSecret, &user.IsBot, &user.BotDescription, &user.BotLastIconUpdate); err != nil {
+			return failure(err)
+		}
+		if err = json.Unmarshal(props, &user.Props); err != nil {
+			return failure(err)
+		}
+		if err = json.Unmarshal(notifyProps, &user.NotifyProps); err != nil {
+			return failure(err)
+		}
+		if err = json.Unmarshal(timezone, &user.Timezone); err != nil {
+			return failure(err)
+		}
+		users = append(users, &user)
+	}
+	err = rows.Err()
+	if err != nil {
+		return failure(err)
 	}
 
 	userMap := make(map[string]*model.User)
@@ -625,10 +632,6 @@ func (us SqlUserStore) GetAllProfilesInChannel(channelId string, allowFromCache 
 	for _, u := range users {
 		u.Sanitize(map[string]bool{})
 		userMap[u.Id] = u
-	}
-
-	if allowFromCache {
-		profilesInChannelCache.AddWithExpiresInSecs(channelId, userMap, PROFILES_IN_CHANNEL_CACHE_SEC)
 	}
 
 	return userMap, nil
@@ -665,7 +668,8 @@ func (us SqlUserStore) GetProfilesNotInChannel(teamId string, channelId string, 
 	return users, nil
 }
 
-func (us SqlUserStore) GetProfilesWithoutTeam(offset int, limit int, viewRestrictions *model.ViewUsersRestrictions) ([]*model.User, *model.AppError) {
+func (us SqlUserStore) GetProfilesWithoutTeam(options *model.UserGetOptions) ([]*model.User, *model.AppError) {
+	isPostgreSQL := us.DriverName() == model.DATABASE_DRIVER_POSTGRES
 	query := us.usersQuery.
 		Where(`(
 			SELECT
@@ -677,9 +681,15 @@ func (us SqlUserStore) GetProfilesWithoutTeam(offset int, limit int, viewRestric
 				AND TeamMembers.DeleteAt = 0
 		) = 0`).
 		OrderBy("u.Username ASC").
-		Offset(uint64(offset)).Limit(uint64(limit))
+		Offset(uint64(options.Page * options.PerPage)).Limit(uint64(options.PerPage))
 
-	query = applyViewRestrictionsFilter(query, viewRestrictions, true)
+	query = applyViewRestrictionsFilter(query, options.ViewRestrictions, true)
+
+	query = applyRoleFilter(query, options.Role, isPostgreSQL)
+
+	if options.Inactive {
+		query = query.Where("u.DeleteAt != 0")
+	}
 
 	queryString, args, err := query.ToSql()
 	if err != nil {
@@ -786,46 +796,15 @@ func (us SqlUserStore) GetNewUsersForTeam(teamId string, offset, limit int, view
 	return users, nil
 }
 
-func (us SqlUserStore) GetProfileByIds(userIds []string, options *store.UserGetByIdsOpts, allowFromCache bool) ([]*model.User, *model.AppError) {
+func (us SqlUserStore) GetProfileByIds(userIds []string, options *store.UserGetByIdsOpts, _ bool) ([]*model.User, *model.AppError) {
 	if options == nil {
 		options = &store.UserGetByIdsOpts{}
 	}
 
 	users := []*model.User{}
-	remainingUserIds := make([]string, 0)
-
-	if allowFromCache {
-		for _, userId := range userIds {
-			if cacheItem, ok := profileByIdsCache.Get(userId); ok {
-				u := &model.User{}
-				*u = *cacheItem.(*model.User)
-
-				if options.Since == 0 || u.UpdateAt > options.Since {
-					users = append(users, u)
-				}
-			} else {
-				remainingUserIds = append(remainingUserIds, userId)
-			}
-		}
-		if us.metrics != nil {
-			us.metrics.AddMemCacheHitCounter("Profile By Ids", float64(len(users)))
-			us.metrics.AddMemCacheMissCounter("Profile By Ids", float64(len(remainingUserIds)))
-		}
-	} else {
-		remainingUserIds = userIds
-		if us.metrics != nil {
-			us.metrics.AddMemCacheMissCounter("Profile By Ids", float64(len(remainingUserIds)))
-		}
-	}
-
-	// If everything came from the cache then just return
-	if len(remainingUserIds) == 0 {
-		return users, nil
-	}
-
 	query := us.usersQuery.
 		Where(map[string]interface{}{
-			"u.Id": remainingUserIds,
+			"u.Id": userIds,
 		}).
 		OrderBy("u.Username ASC")
 
@@ -844,14 +823,6 @@ func (us SqlUserStore) GetProfileByIds(userIds []string, options *store.UserGetB
 
 	if _, err := us.GetReplica().Select(&users, queryString, args...); err != nil {
 		return nil, model.NewAppError("SqlUserStore.GetProfileByIds", "store.sql_user.get_profiles.app_error", nil, err.Error(), http.StatusInternalServerError)
-	}
-
-	for _, u := range users {
-		u.Sanitize(map[string]bool{})
-
-		cpy := &model.User{}
-		*cpy = *u
-		profileByIdsCache.AddWithExpiresInSecs(cpy.Id, cpy, PROFILE_BY_IDS_CACHE_SEC)
 	}
 
 	return users, nil
@@ -995,6 +966,24 @@ func (us SqlUserStore) GetAllUsingAuthService(authService string) ([]*model.User
 	return users, nil
 }
 
+func (us SqlUserStore) GetAllNotInAuthService(authServices []string) ([]*model.User, *model.AppError) {
+	query := us.usersQuery.
+		Where(sq.NotEq{"u.AuthService": authServices}).
+		OrderBy("u.Username ASC")
+
+	queryString, args, err := query.ToSql()
+	if err != nil {
+		return nil, model.NewAppError("SqlUserStore.GetAllNotInAuthService", "store.sql_user.app_error", nil, err.Error(), http.StatusInternalServerError)
+	}
+
+	var users []*model.User
+	if _, err := us.GetReplica().Select(&users, queryString, args...); err != nil {
+		return nil, model.NewAppError("SqlUserStore.GetAllNotInAuthService", "store.sql_user.get_by_auth.other.app_error", nil, "", http.StatusInternalServerError)
+	}
+
+	return users, nil
+}
+
 func (us SqlUserStore) GetByUsername(username string) (*model.User, *model.AppError) {
 	query := us.usersQuery.Where("u.Username = ?", username)
 
@@ -1075,7 +1064,7 @@ func (us SqlUserStore) Count(options model.UserCountOptions) (int64, *model.AppE
 	} else {
 		query = query.LeftJoin("Bots ON u.Id = Bots.UserId").Where("Bots.UserId IS NULL")
 		if options.ExcludeRegularUsers {
-			// Currenty this doesn't make sense because it will always return 0
+			// Currently this doesn't make sense because it will always return 0
 			return int64(0), model.NewAppError("SqlUserStore.Count", "store.sql_user.count.app_error", nil, "", http.StatusInternalServerError)
 		}
 	}
@@ -1104,23 +1093,30 @@ func (us SqlUserStore) Count(options model.UserCountOptions) (int64, *model.AppE
 func (us SqlUserStore) AnalyticsActiveCount(timePeriod int64, options model.UserCountOptions) (int64, *model.AppError) {
 
 	time := model.GetMillis() - timePeriod
+	query := us.getQueryBuilder().Select("COUNT(*)").From("Status AS s").Where("LastActivityAt > :Time", map[string]interface{}{"Time": time})
 
-	query := "SELECT COUNT(*) FROM Status s"
-
-	if options.IncludeBotAccounts {
-		query += " WHERE LastActivityAt > :Time"
-	} else {
-		query += " LEFT JOIN Bots ON s.UserId = Bots.UserId WHERE Bots.UserId IS NULL AND LastActivityAt > :Time"
+	if !options.IncludeBotAccounts {
+		query = query.LeftJoin("Bots ON s.UserId = Bots.UserId").Where("Bots.UserId IS NULL")
 	}
 
-	v, err := us.GetReplica().SelectInt(query, map[string]interface{}{"Time": time})
+	if !options.IncludeDeleted {
+		query = query.LeftJoin("Users ON s.UserId = Users.Id").Where("Users.DeleteAt = 0")
+	}
+
+	queryStr, args, err := query.ToSql()
+
+	if err != nil {
+		return 0, model.NewAppError("SqlUserStore.Get", "store.sql_user.app_error", nil, err.Error(), http.StatusInternalServerError)
+	}
+
+	v, err := us.GetReplica().SelectInt(queryStr, args...)
 	if err != nil {
 		return 0, model.NewAppError("SqlUserStore.AnalyticsDailyActiveUsers", "store.sql_user.analytics_daily_active_users.app_error", nil, err.Error(), http.StatusInternalServerError)
 	}
 	return v, nil
 }
 
-func (us SqlUserStore) GetUnreadCount(userId string) (int64, error) {
+func (us SqlUserStore) GetUnreadCount(userId string) (int64, *model.AppError) {
 	query := `
 		SELECT SUM(CASE WHEN c.Type = 'D' THEN (c.TotalMsgCount - cm.MsgCount) ELSE cm.MentionCount END)
 		FROM Channels c
@@ -1222,15 +1218,6 @@ func (us SqlUserStore) SearchInChannel(channelId string, term string, options *m
 	return us.performSearch(query, term, options)
 }
 
-var escapeLikeSearchChar = []string{
-	"%",
-	"_",
-}
-
-var ignoreLikeSearchChar = []string{
-	"*",
-}
-
 var spaceFulltextSearchChar = []string{
 	"<",
 	">",
@@ -1265,17 +1252,9 @@ func generateSearchQuery(query sq.SelectBuilder, terms []string, fields []string
 }
 
 func (us SqlUserStore) performSearch(query sq.SelectBuilder, term string, options *model.UserSearchOptions) ([]*model.User, *model.AppError) {
-	// These chars must be removed from the like query.
-	for _, c := range ignoreLikeSearchChar {
-		term = strings.Replace(term, c, "", -1)
-	}
+	term = sanitizeSearchTerm(term, "*")
 
-	// These chars must be escaped in the like query.
-	for _, c := range escapeLikeSearchChar {
-		term = strings.Replace(term, c, "*"+c, -1)
-	}
-
-	searchType := USER_SEARCH_TYPE_NAMES_NO_FULL_NAME
+	var searchType []string
 	if options.AllowEmails {
 		if options.AllowFullNames {
 			searchType = USER_SEARCH_TYPE_ALL
@@ -1329,6 +1308,14 @@ func (us SqlUserStore) AnalyticsGetInactiveUsersCount() (int64, *model.AppError)
 	return count, nil
 }
 
+func (us SqlUserStore) AnalyticsGetGuestCount() (int64, *model.AppError) {
+	count, err := us.GetReplica().SelectInt("SELECT count(*) FROM Users WHERE Roles LIKE :Roles and DeleteAt = 0", map[string]interface{}{"Roles": "%system_guest%"})
+	if err != nil {
+		return int64(0), model.NewAppError("SqlUserStore.AnalyticsGetSystemAdminCount", "store.sql_user.analytics_get_system_admin_count.app_error", nil, err.Error(), http.StatusInternalServerError)
+	}
+	return count, nil
+}
+
 func (us SqlUserStore) AnalyticsGetSystemAdminCount() (int64, *model.AppError) {
 	count, err := us.GetReplica().SelectInt("SELECT count(*) FROM Users WHERE Roles LIKE :Roles and DeleteAt = 0", map[string]interface{}{"Roles": "%system_admin%"})
 	if err != nil {
@@ -1367,8 +1354,7 @@ func (us SqlUserStore) GetProfilesNotInTeam(teamId string, groupConstrained bool
 }
 
 func (us SqlUserStore) GetEtagForProfilesNotInTeam(teamId string) string {
-	var querystr string
-	querystr = `
+	querystr := `
 		SELECT
 			CONCAT(MAX(UpdateAt), '.', COUNT(Id)) as etag
 		FROM
@@ -1457,10 +1443,9 @@ func (us SqlUserStore) GetUsersBatchForIndexing(startTime, endTime int64, limit 
 		OrderBy("u.CreateAt").
 		Limit(uint64(limit)).
 		ToSql()
-	_, err1 := us.GetSearchReplica().Select(&users, usersQuery, args...)
-
-	if err1 != nil {
-		return nil, model.NewAppError("SqlUserStore.GetUsersBatchForIndexing", "store.sql_user.get_users_batch_for_indexing.get_users.app_error", nil, err1.Error(), http.StatusInternalServerError)
+	_, err := us.GetSearchReplica().Select(&users, usersQuery, args...)
+	if err != nil {
+		return nil, model.NewAppError("SqlUserStore.GetUsersBatchForIndexing", "store.sql_user.get_users_batch_for_indexing.get_users.app_error", nil, err.Error(), http.StatusInternalServerError)
 	}
 
 	userIds := []string{}
@@ -1487,10 +1472,9 @@ func (us SqlUserStore) GetUsersBatchForIndexing(startTime, endTime int64, limit 
 		Join("Channels c ON cm.ChannelId = c.Id").
 		Where(sq.Eq{"c.Type": "O", "cm.UserId": userIds}).
 		ToSql()
-	_, err2 := us.GetSearchReplica().Select(&channelMembers, channelMembersQuery, args...)
-
-	if err2 != nil {
-		return nil, model.NewAppError("SqlUserStore.GetUsersBatchForIndexing", "store.sql_user.get_users_batch_for_indexing.get_channel_members.app_error", nil, err2.Error(), http.StatusInternalServerError)
+	_, err = us.GetSearchReplica().Select(&channelMembers, channelMembersQuery, args...)
+	if err != nil {
+		return nil, model.NewAppError("SqlUserStore.GetUsersBatchForIndexing", "store.sql_user.get_users_batch_for_indexing.get_channel_members.app_error", nil, err.Error(), http.StatusInternalServerError)
 	}
 
 	var teamMembers []*model.TeamMember
@@ -1499,10 +1483,9 @@ func (us SqlUserStore) GetUsersBatchForIndexing(startTime, endTime int64, limit 
 		From("TeamMembers").
 		Where(sq.Eq{"UserId": userIds, "DeleteAt": 0}).
 		ToSql()
-	_, err3 := us.GetSearchReplica().Select(&teamMembers, teamMembersQuery, args...)
-
-	if err3 != nil {
-		return nil, model.NewAppError("SqlUserStore.GetUsersBatchForIndexing", "store.sql_user.get_users_batch_for_indexing.get_team_members.app_error", nil, err3.Error(), http.StatusInternalServerError)
+	_, err = us.GetSearchReplica().Select(&teamMembers, teamMembersQuery, args...)
+	if err != nil {
+		return nil, model.NewAppError("SqlUserStore.GetUsersBatchForIndexing", "store.sql_user.get_users_batch_for_indexing.get_team_members.app_error", nil, err.Error(), http.StatusInternalServerError)
 	}
 
 	userMap := map[string]*model.UserForIndexing{}
@@ -1635,8 +1618,10 @@ func (us SqlUserStore) PromoteGuestToUser(userId string) *model.AppError {
 		}
 	}
 
+	curTime := model.GetMillis()
 	query := us.getQueryBuilder().Update("Users").
 		Set("Roles", strings.Join(roles, " ")).
+		Set("UpdateAt", curTime).
 		Where(sq.Eq{"Id": userId})
 
 	queryString, args, err := query.ToSql()
@@ -1705,8 +1690,10 @@ func (us SqlUserStore) DemoteUserToGuest(userId string) *model.AppError {
 		}
 	}
 
+	curTime := model.GetMillis()
 	query := us.getQueryBuilder().Update("Users").
 		Set("Roles", strings.Join(newRoles, " ")).
+		Set("UpdateAt", curTime).
 		Where(sq.Eq{"Id": userId})
 
 	queryString, args, err := query.ToSql()
@@ -1750,4 +1737,56 @@ func (us SqlUserStore) DemoteUserToGuest(userId string) *model.AppError {
 		return model.NewAppError("SqlUserStore.DemoteGuestToUser", "store.sql_user.demote_user_to_guest.commit_transaction.app_error", nil, err.Error(), http.StatusInternalServerError)
 	}
 	return nil
+}
+
+func (us SqlUserStore) AutocompleteUsersInChannel(teamId, channelId, term string, options *model.UserSearchOptions) (*model.UserAutocompleteInChannel, *model.AppError) {
+	autocomplete := &model.UserAutocompleteInChannel{}
+	uchan := make(chan store.StoreResult, 1)
+	go func() {
+		users, err := us.SearchInChannel(channelId, term, options)
+		uchan <- store.StoreResult{Data: users, Err: err}
+		close(uchan)
+	}()
+
+	nuchan := make(chan store.StoreResult, 1)
+	go func() {
+		users, err := us.SearchNotInChannel(teamId, channelId, term, options)
+		nuchan <- store.StoreResult{Data: users, Err: err}
+		close(nuchan)
+	}()
+
+	result := <-uchan
+	if result.Err != nil {
+		return nil, result.Err
+	}
+	users := result.Data.([]*model.User)
+	autocomplete.InChannel = users
+
+	result = <-nuchan
+	if result.Err != nil {
+		return nil, result.Err
+	}
+	users = result.Data.([]*model.User)
+	autocomplete.OutOfChannel = users
+	return autocomplete, nil
+}
+
+// GetKnownUsers returns the list of user ids of users with any direct
+// relationship with a user. That means any user sharing any channel, including
+// direct and group channels.
+func (us SqlUserStore) GetKnownUsers(userId string) ([]string, *model.AppError) {
+	var userIds []string
+	usersQuery, args, _ := us.getQueryBuilder().
+		Select("DISTINCT ocm.UserId").
+		From("ChannelMembers AS cm").
+		Join("ChannelMembers AS ocm ON ocm.ChannelId = cm.ChannelId").
+		Where(sq.NotEq{"ocm.UserId": userId}).
+		Where(sq.Eq{"cm.UserId": userId}).
+		ToSql()
+	_, err := us.GetSearchReplica().Select(&userIds, usersQuery, args...)
+	if err != nil {
+		return nil, model.NewAppError("SqlUserStore.GetKnownUsers", "store.sql_user.get_known_users.get_users.app_error", nil, err.Error(), http.StatusInternalServerError)
+	}
+
+	return userIds, nil
 }

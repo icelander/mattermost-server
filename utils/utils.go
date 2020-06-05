@@ -1,5 +1,5 @@
-// Copyright (c) 2016-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
 
 package utils
 
@@ -17,6 +17,29 @@ func StringInSlice(a string, slice []string) bool {
 		}
 	}
 	return false
+}
+
+// RemoveStringFromSlice removes the first occurrence of a from slice.
+func RemoveStringFromSlice(a string, slice []string) []string {
+	for i, str := range slice {
+		if str == a {
+			return append(slice[:i], slice[i+1:]...)
+		}
+	}
+	return slice
+}
+
+// RemoveStringsFromSlice removes all occurrences of strings from slice.
+func RemoveStringsFromSlice(slice []string, strings ...string) []string {
+	newSlice := []string{}
+
+	for _, item := range slice {
+		if !StringInSlice(item, strings) {
+			newSlice = append(newSlice, item)
+		}
+	}
+
+	return newSlice
 }
 
 func StringArrayIntersection(arr1, arr2 []string) []string {

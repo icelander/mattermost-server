@@ -1,9 +1,11 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// See LICENSE.txt for license information.
 
 package model
 
 import (
+	"bytes"
+	"encoding/base32"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -18,18 +20,22 @@ import (
 func TestNewId(t *testing.T) {
 	for i := 0; i < 1000; i++ {
 		id := NewId()
-		if len(id) > 26 {
-			t.Fatal("ids shouldn't be longer than 26 chars")
-		}
+		require.LessOrEqual(t, len(id), 26, "ids shouldn't be longer than 26 chars")
 	}
 }
 
 func TestRandomString(t *testing.T) {
 	for i := 0; i < 1000; i++ {
-		r := NewRandomString(32)
-		if len(r) != 32 {
-			t.Fatal("should be 32 chars")
-		}
+		str := NewRandomString(i)
+		require.Len(t, str, i)
+		require.NotContains(t, str, "=")
+	}
+}
+
+func TestRandomBase32String(t *testing.T) {
+	for i := 0; i < 1000; i++ {
+		str := NewRandomBase32String(i)
+		require.Len(t, str, base32.StdEncoding.EncodedLen(i))
 	}
 }
 
@@ -39,9 +45,7 @@ func TestGetMillisForTime(t *testing.T) {
 
 	result := GetMillisForTime(thisTime)
 
-	if thisTimeMillis != result {
-		t.Fatalf(fmt.Sprintf("millis are not the same: %d and %d", thisTimeMillis, result))
-	}
+	require.Equalf(t, thisTimeMillis, result, "millis are not the same: %d and %d", thisTimeMillis, result)
 }
 
 func TestPadDateStringZeros(t *testing.T) {
@@ -100,14 +104,10 @@ func TestMapJson(t *testing.T) {
 
 	rm := MapFromJson(strings.NewReader(json))
 
-	if rm["id"] != "test_id" {
-		t.Fatal("map should be valid")
-	}
+	require.Equal(t, rm["id"], "test_id", "map should be valid")
 
 	rm2 := MapFromJson(strings.NewReader(""))
-	if len(rm2) > 0 {
-		t.Fatal("make should be ivalid")
-	}
+	require.LessOrEqual(t, len(rm2), 0, "make should be ivalid")
 }
 
 func TestIsValidEmail(t *testing.T) {
@@ -191,16 +191,6 @@ func TestIsValidEmail(t *testing.T) {
 		t.Run(testCase.Input, func(t *testing.T) {
 			assert.Equal(t, testCase.Expected, IsValidEmail(testCase.Input))
 		})
-	}
-}
-
-func TestValidLower(t *testing.T) {
-	if !IsLower("corey+test@hulen.com") {
-		t.Error("should be valid")
-	}
-
-	if IsLower("Corey+test@hulen.com") {
-		t.Error("should be invalid")
 	}
 }
 
@@ -295,9 +285,8 @@ func TestStringArray_Equal(t *testing.T) {
 
 func TestParseHashtags(t *testing.T) {
 	for input, output := range hashtags {
-		if o, _ := ParseHashtags(input); o != output {
-			t.Fatal("failed to parse hashtags from input=" + input + " expected=" + output + " actual=" + o)
-		}
+		o, _ := ParseHashtags(input)
+		require.Equal(t, o, output, "failed to parse hashtags from input="+input+" expected="+output+" actual="+o)
 	}
 }
 
@@ -350,16 +339,12 @@ func TestIsValidAlphaNum(t *testing.T) {
 
 	for _, tc := range cases {
 		actual := IsValidAlphaNum(tc.Input)
-		if actual != tc.Result {
-			t.Fatalf("case: %v\tshould returned: %#v", tc, tc.Result)
-		}
+		require.Equalf(t, actual, tc.Result, "case: %v\tshould returned: %#v", tc, tc.Result)
 	}
 }
 
 func TestGetServerIpAddress(t *testing.T) {
-	if len(GetServerIpAddress("")) == 0 {
-		t.Fatal("Should find local ip address")
-	}
+	require.NotEmpty(t, GetServerIpAddress(""), "Should find local ip address")
 }
 
 func TestIsValidAlphaNumHyphenUnderscore(t *testing.T) {
@@ -419,9 +404,7 @@ func TestIsValidAlphaNumHyphenUnderscore(t *testing.T) {
 
 	for _, tc := range casesWithFormat {
 		actual := IsValidAlphaNumHyphenUnderscore(tc.Input, true)
-		if actual != tc.Result {
-			t.Fatalf("case: %v\tshould returned: %#v", tc, tc.Result)
-		}
+		require.Equalf(t, actual, tc.Result, "case: %v\tshould returned: %#v", tc, tc.Result)
 	}
 
 	casesWithoutFormat := []struct {
@@ -489,9 +472,7 @@ func TestIsValidAlphaNumHyphenUnderscore(t *testing.T) {
 
 	for _, tc := range casesWithoutFormat {
 		actual := IsValidAlphaNumHyphenUnderscore(tc.Input, false)
-		if actual != tc.Result {
-			t.Fatalf("case: '%v'\tshould returned: %#v", tc.Input, tc.Result)
-		}
+		require.Equalf(t, actual, tc.Result, "case: '%v'\tshould returned: %#v", tc.Input, tc.Result)
 	}
 }
 
@@ -524,9 +505,7 @@ func TestIsValidId(t *testing.T) {
 
 	for _, tc := range cases {
 		actual := IsValidId(tc.Input)
-		if actual != tc.Result {
-			t.Fatalf("case: %v\tshould returned: %#v", tc, tc.Result)
-		}
+		require.Equalf(t, actual, tc.Result, "case: %v\tshould returned: %#v", tc, tc.Result)
 	}
 }
 
@@ -765,5 +744,35 @@ func checkNowhereNil(t *testing.T, name string, value interface{}) bool {
 
 	default:
 		return true
+	}
+}
+
+func TestSanitizeUnicode(t *testing.T) {
+	buf := bytes.Buffer{}
+	buf.WriteString("Hello")
+	buf.WriteRune(0x1d173)
+	buf.WriteRune(0x1d17a)
+	buf.WriteString(" there.")
+
+	musicArg := buf.String()
+	musicWant := "Hello there."
+
+	tests := []struct {
+		name string
+		arg  string
+		want string
+	}{
+		{name: "empty string", arg: "", want: ""},
+		{name: "ascii only", arg: "Hello There", want: "Hello There"},
+		{name: "allowed unicode", arg: "Ādam likes Iñtërnâtiônàližætiøn", want: "Ādam likes Iñtërnâtiônàližætiøn"},
+		{name: "allowed unicode escaped", arg: "\u00eaI like hats\u00e2", want: "êI like hatsâ"},
+		{name: "blacklist char, don't reverse string", arg: "\u202E2resu", want: "2resu"},
+		{name: "blacklist chars, scoping musical notation", arg: musicArg, want: musicWant},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := SanitizeUnicode(tt.arg)
+			assert.Equal(t, tt.want, got)
+		})
 	}
 }

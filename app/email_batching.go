@@ -1,5 +1,5 @@
-// Copyright (c) 2016-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
 
 package app
 
@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mattermost/mattermost-server/mlog"
-	"github.com/mattermost/mattermost-server/model"
-	"github.com/mattermost/mattermost-server/utils"
+	"github.com/mattermost/mattermost-server/v5/mlog"
+	"github.com/mattermost/mattermost-server/v5/model"
+	"github.com/mattermost/mattermost-server/v5/utils"
 
 	"net/http"
 
@@ -40,7 +40,7 @@ func (a *App) AddNotificationEmailToBatch(user *model.User, post *model.Post, te
 		return model.NewAppError("AddNotificationEmailToBatch", "api.email_batching.add_notification_email_to_batch.disabled.app_error", nil, "", http.StatusNotImplemented)
 	}
 
-	if !a.Srv.EmailBatching.Add(user, post, team) {
+	if !a.Srv().EmailBatching.Add(user, post, team) {
 		mlog.Error("Email batching job's receiving channel was full. Please increase the EmailBatchingBufferSize.")
 		return model.NewAppError("AddNotificationEmailToBatch", "api.email_batching.add_notification_email_to_batch.channel_full.app_error", nil, "", http.StatusInternalServerError)
 	}
@@ -71,7 +71,7 @@ func NewEmailBatchingJob(s *Server, bufferSize int) *EmailBatchingJob {
 }
 
 func (job *EmailBatchingJob) Start() {
-	mlog.Debug(fmt.Sprintf("Email batching job starting. Checking for pending emails every %v seconds.", *job.server.Config().EmailSettings.EmailBatchingInterval))
+	mlog.Debug("Email batching job starting. Checking for pending emails periodically.", mlog.Int("interval_in_seconds", *job.server.Config().EmailSettings.EmailBatchingInterval))
 	newTask := model.CreateRecurringTask(EMAIL_BATCHING_TASK_NAME, job.CheckPendingEmails, time.Duration(*job.server.Config().EmailSettings.EmailBatchingInterval)*time.Second)
 
 	job.taskMutex.Lock()
@@ -107,7 +107,7 @@ func (job *EmailBatchingJob) CheckPendingEmails() {
 	// without actually sending emails
 	job.checkPendingNotifications(time.Now(), job.server.sendBatchedEmailNotification)
 
-	mlog.Debug(fmt.Sprintf("Email batching job ran. %v user(s) still have notifications pending.", len(job.pendingNotifications)))
+	mlog.Debug("Email batching job ran. Some users still have notifications pending.", mlog.Int("number_of_users", len(job.pendingNotifications)))
 }
 
 func (job *EmailBatchingJob) handleNewNotifications() {
@@ -142,7 +142,7 @@ func (job *EmailBatchingJob) checkPendingNotifications(now time.Time, handler fu
 
 			team, err := job.server.Store.Team().GetByName(notifications[0].teamName)
 			if err != nil {
-				mlog.Error(fmt.Sprint("Unable to find Team id for notification", err))
+				mlog.Error("Unable to find Team id for notification", mlog.Err(err))
 				continue
 			}
 
@@ -154,13 +154,13 @@ func (job *EmailBatchingJob) checkPendingNotifications(now time.Time, handler fu
 			// all queued notifications
 			channelMembers, err := job.server.Store.Channel().GetMembersForUser(inspectedTeamNames[notification.teamName], userId)
 			if err != nil {
-				mlog.Error(fmt.Sprint("Unable to find ChannelMembers for user", err))
+				mlog.Error("Unable to find ChannelMembers for user", mlog.Err(err))
 				continue
 			}
 
 			for _, channelMember := range *channelMembers {
 				if channelMember.LastViewedAt >= batchStartTime {
-					mlog.Debug(fmt.Sprintf("Deleted notifications for user %s", userId), mlog.String("user_id", userId))
+					mlog.Debug("Deleted notifications for user", mlog.String("user_id", userId))
 					delete(job.pendingNotifications, userId)
 					break
 				}
@@ -182,13 +182,13 @@ func (job *EmailBatchingJob) checkPendingNotifications(now time.Time, handler fu
 			}
 		}
 
-		// send the email notification if it's been long enough
-		if now.Sub(time.Unix(batchStartTime/1000, 0)) > time.Duration(interval)*time.Second {
+		// send the email notification if there are notifications to send AND it's been long enough
+		if len(job.pendingNotifications[userId]) > 0 && now.Sub(time.Unix(batchStartTime/1000, 0)) > time.Duration(interval)*time.Second {
 			job.server.Go(func(userId string, notifications []*batchedNotification) func() {
 				return func() {
 					handler(userId, notifications)
 				}
-			}(userId, notifications))
+			}(userId, job.pendingNotifications[userId]))
 			delete(job.pendingNotifications, userId)
 		}
 	}
@@ -235,13 +235,13 @@ func (s *Server) sendBatchedEmailNotification(userId string, notifications []*ba
 		"Day":      tm.Day(),
 	})
 
-	body := s.FakeApp().NewEmailTemplate("post_batched_body", user.Locale)
+	body := s.FakeApp().newEmailTemplate("post_batched_body", user.Locale)
 	body.Props["SiteURL"] = *s.Config().ServiceSettings.SiteURL
 	body.Props["Posts"] = template.HTML(contents)
 	body.Props["BodyText"] = translateFunc("api.email_batching.send_batched_email_notification.body_text", len(notifications))
 
-	if err := s.FakeApp().SendNotificationMail(user.Email, subject, body.Render()); err != nil {
-		mlog.Warn(fmt.Sprintf("Unable to send batched email notification err=%v", err), mlog.String("email", user.Email))
+	if err := s.FakeApp().sendNotificationMail(user.Email, subject, body.Render()); err != nil {
+		mlog.Warn("Unable to send batched email notification", mlog.String("email", user.Email), mlog.Err(err))
 	}
 }
 
@@ -249,9 +249,9 @@ func (s *Server) renderBatchedPost(notification *batchedNotification, channel *m
 	// don't include message contents if email notification contents type is set to generic
 	var template *utils.HTMLTemplate
 	if emailNotificationContentsType == model.EMAIL_NOTIFICATION_CONTENTS_FULL {
-		template = s.FakeApp().NewEmailTemplate("post_batched_post_full", userLocale)
+		template = s.FakeApp().newEmailTemplate("post_batched_post_full", userLocale)
 	} else {
-		template = s.FakeApp().NewEmailTemplate("post_batched_post_generic", userLocale)
+		template = s.FakeApp().newEmailTemplate("post_batched_post_generic", userLocale)
 	}
 
 	template.Props["Button"] = translateFunc("api.email_batching.render_batched_post.go_to_post")

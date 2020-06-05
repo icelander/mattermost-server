@@ -1,20 +1,19 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
-// See License.txt for license information.
+// See LICENSE.txt for license information.
 
 package app
 
 import (
-	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"runtime"
 	"strconv"
 
-	"github.com/mattermost/mattermost-server/mlog"
-	"github.com/mattermost/mattermost-server/model"
-	"github.com/mattermost/mattermost-server/services/mailservice"
-	"github.com/mattermost/mattermost-server/utils"
+	"github.com/mattermost/mattermost-server/v5/mlog"
+	"github.com/mattermost/mattermost-server/v5/model"
+	"github.com/mattermost/mattermost-server/v5/services/mailservice"
+	"github.com/mattermost/mattermost-server/v5/utils"
 )
 
 const (
@@ -77,7 +76,7 @@ func (s *Server) DoSecurityUpdateCheck() {
 			v.Set(PROP_SECURITY_ACTIVE_USER_COUNT, strconv.FormatInt(ucr, 10))
 		}
 
-		if teamCount, err := s.Store.Team().AnalyticsTeamCount(); err == nil {
+		if teamCount, err := s.Store.Team().AnalyticsTeamCount(false); err == nil {
 			v.Set(PROP_SECURITY_TEAM_COUNT, strconv.FormatInt(teamCount, 10))
 		}
 
@@ -107,14 +106,14 @@ func (s *Server) DoSecurityUpdateCheck() {
 					}
 
 					body, err := ioutil.ReadAll(resBody.Body)
-					res.Body.Close()
+					resBody.Body.Close()
 					if err != nil || resBody.StatusCode != 200 {
 						mlog.Error("Failed to read security bulletin details")
 						return
 					}
 
 					for _, user := range users {
-						mlog.Info(fmt.Sprintf("Sending security bulletin for %v to %v", bulletin.Id, user.Email))
+						mlog.Info("Sending security bulletin", mlog.String("bulletin_id", bulletin.Id), mlog.String("user_email", user.Email))
 						license := s.License()
 						mailservice.SendMailUsingConfig(user.Email, utils.T("mattermost.bulletin.subject"), string(body), s.Config(), license != nil && *license.Features.Compliance)
 					}
