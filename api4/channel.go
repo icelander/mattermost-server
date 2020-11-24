@@ -9,10 +9,10 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/mattermost/mattermost-server/v5/app"
 	"github.com/mattermost/mattermost-server/v5/audit"
 	"github.com/mattermost/mattermost-server/v5/mlog"
 	"github.com/mattermost/mattermost-server/v5/model"
-	"github.com/mattermost/mattermost-server/v5/store"
 )
 
 func (api *API) InitChannel() {
@@ -40,9 +40,9 @@ func (api *API) InitChannel() {
 	api.BaseRoutes.ChannelCategories.Handle("", api.ApiSessionRequired(updateCategoriesForTeamForUser)).Methods("PUT")
 	api.BaseRoutes.ChannelCategories.Handle("/order", api.ApiSessionRequired(getCategoryOrderForTeamForUser)).Methods("GET")
 	api.BaseRoutes.ChannelCategories.Handle("/order", api.ApiSessionRequired(updateCategoryOrderForTeamForUser)).Methods("PUT")
-	api.BaseRoutes.ChannelCategories.Handle("/{category_id:[A-Za-z0-9]+}", api.ApiSessionRequired(getCategoryForTeamForUser)).Methods("GET")
-	api.BaseRoutes.ChannelCategories.Handle("/{category_id:[A-Za-z0-9]+}", api.ApiSessionRequired(updateCategoryForTeamForUser)).Methods("PUT")
-	api.BaseRoutes.ChannelCategories.Handle("/{category_id:[A-Za-z0-9]+}", api.ApiSessionRequired(deleteCategoryForTeamForUser)).Methods("DELETE")
+	api.BaseRoutes.ChannelCategories.Handle("/{category_id:[A-Za-z0-9_-]+}", api.ApiSessionRequired(getCategoryForTeamForUser)).Methods("GET")
+	api.BaseRoutes.ChannelCategories.Handle("/{category_id:[A-Za-z0-9_-]+}", api.ApiSessionRequired(updateCategoryForTeamForUser)).Methods("PUT")
+	api.BaseRoutes.ChannelCategories.Handle("/{category_id:[A-Za-z0-9_-]+}", api.ApiSessionRequired(deleteCategoryForTeamForUser)).Methods("DELETE")
 
 	api.BaseRoutes.Channel.Handle("", api.ApiSessionRequired(getChannel)).Methods("GET")
 	api.BaseRoutes.Channel.Handle("", api.ApiSessionRequired(updateChannel)).Methods("PUT")
@@ -1150,7 +1150,15 @@ func getChannelByNameForTeamName(c *Context, w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if !c.App.SessionHasPermissionToChannel(*c.App.Session(), channel.Id, model.PERMISSION_READ_CHANNEL) {
+	teamOk := c.App.SessionHasPermissionToTeam(*c.App.Session(), channel.TeamId, model.PERMISSION_READ_PUBLIC_CHANNEL)
+	channelOk := c.App.SessionHasPermissionToChannel(*c.App.Session(), channel.Id, model.PERMISSION_READ_CHANNEL)
+
+	if channel.Type == model.CHANNEL_OPEN {
+		if !teamOk && !channelOk {
+			c.SetPermissionError(model.PERMISSION_READ_PUBLIC_CHANNEL)
+			return
+		}
+	} else if !channelOk {
 		c.Err = model.NewAppError("getChannelByNameForTeamName", "app.channel.get_by_name.missing.app_error", nil, "teamId="+channel.TeamId+", "+"name="+channel.Name+"", http.StatusNotFound)
 		return
 	}
@@ -1473,7 +1481,7 @@ func addChannelMember(c *Context, w http.ResponseWriter, r *http.Request) {
 
 	isNewMembership := false
 	if _, err = c.App.GetChannelMember(member.ChannelId, member.UserId); err != nil {
-		if err.Id == store.MISSING_CHANNEL_MEMBER_ERROR {
+		if err.Id == app.MISSING_CHANNEL_MEMBER_ERROR {
 			isNewMembership = true
 		} else {
 			c.Err = err
@@ -1728,7 +1736,7 @@ func channelMemberCountsByGroup(c *Context, w http.ResponseWriter, r *http.Reque
 
 	includeTimezones := r.URL.Query().Get("include_timezones") == "true"
 
-	channelMemberCounts, err := c.App.Srv().Store.Channel().GetMemberCountsByGroup(c.Params.ChannelId, includeTimezones)
+	channelMemberCounts, err := c.App.GetMemberCountsByGroup(c.Params.ChannelId, includeTimezones)
 	if err != nil {
 		c.Err = err
 		return

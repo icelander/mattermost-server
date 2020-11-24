@@ -670,11 +670,9 @@ func TestPatchConfig(t *testing.T) {
 		CheckNoError(t, resp)
 		require.Equal(t, nonEmptyURL, *cfg.ServiceSettings.SiteURL)
 
-		// Check that sending an empty config returns an error.
+		// Check that sending an empty config returns no error.
 		_, resp = th.SystemAdminClient.PatchConfig(&model.Config{})
-		require.NotNil(t, resp.Error)
-		CheckBadRequestStatus(t, resp)
-		assert.Equal(t, "api.config.update_config.clear_siteurl.app_error", resp.Error.Id)
+		CheckNoError(t, resp)
 	})
 }
 
@@ -688,11 +686,11 @@ func TestMigrateConfig(t *testing.T) {
 	})
 
 	th.TestForSystemAdminAndLocal(t, func(t *testing.T, client *model.Client4) {
-		f, err := config.NewStore("from.json", false)
+		f, err := config.NewStore("from.json", false, nil)
 		require.NoError(t, err)
 		defer f.RemoveFile("from.json")
 
-		_, err = config.NewStore("to.json", false)
+		_, err = config.NewStore("to.json", false, nil)
 		require.NoError(t, err)
 		defer f.RemoveFile("to.json")
 

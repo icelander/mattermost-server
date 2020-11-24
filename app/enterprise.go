@@ -96,10 +96,22 @@ func RegisterJobsActiveUsersInterface(f func(*App) tjobs.ActiveUsersJobInterface
 	jobsActiveUsersInterface = f
 }
 
+var jobsCloudInterface func(*Server) ejobs.CloudJobInterface
+
+func RegisterJobsCloudInterface(f func(*Server) ejobs.CloudJobInterface) {
+	jobsCloudInterface = f
+}
+
 var jobsExpiryNotifyInterface func(*App) tjobs.ExpiryNotifyJobInterface
 
 func RegisterJobsExpiryNotifyJobInterface(f func(*App) tjobs.ExpiryNotifyJobInterface) {
 	jobsExpiryNotifyInterface = f
+}
+
+var productNoticesJobInterface func(*App) tjobs.ProductNoticesJobInterface
+
+func RegisterProductNoticesJobInterface(f func(*App) tjobs.ProductNoticesJobInterface) {
+	productNoticesJobInterface = f
 }
 
 var ldapInterface func(*App) einterfaces.LdapInterface
@@ -112,6 +124,12 @@ var messageExportInterface func(*Server) einterfaces.MessageExportInterface
 
 func RegisterMessageExportInterface(f func(*Server) einterfaces.MessageExportInterface) {
 	messageExportInterface = f
+}
+
+var cloudInterface func(*App) einterfaces.CloudInterface
+
+func RegisterCloudInterface(f func(*App) einterfaces.CloudInterface) {
+	cloudInterface = f
 }
 
 var metricsInterface func(*Server) einterfaces.MetricsInterface
@@ -188,5 +206,8 @@ func (a *App) initEnterprise() {
 				mlog.Error("An error occurred while configuring SAML Service Provider", mlog.Err(err))
 			}
 		})
+	}
+	if cloudInterface != nil {
+		a.srv.Cloud = cloudInterface(a)
 	}
 }

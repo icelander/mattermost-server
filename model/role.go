@@ -11,6 +11,9 @@ import (
 
 // SysconsoleAncillaryPermissions maps the non-sysconsole permissions required by each sysconsole view.
 var SysconsoleAncillaryPermissions map[string][]*Permission
+var SystemManagerDefaultPermissions []string
+var SystemUserManagerDefaultPermissions []string
+var SystemReadOnlyAdminDefaultPermissions []string
 
 var BuiltInSchemeManagedRoleIDs []string
 
@@ -42,6 +45,7 @@ func init() {
 		CHANNEL_ADMIN_ROLE_ID,
 	}, NewSystemRoleIDs...)
 
+	// When updating the values here, the values in mattermost-redux must also be updated.
 	SysconsoleAncillaryPermissions = map[string][]*Permission{
 		PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_CHANNELS.Id: {
 			PERMISSION_READ_PUBLIC_CHANNEL,
@@ -66,10 +70,17 @@ func init() {
 		PERMISSION_SYSCONSOLE_READ_REPORTING.Id: {
 			PERMISSION_VIEW_TEAM,
 		},
+		PERMISSION_SYSCONSOLE_WRITE_USERMANAGEMENT_USERS.Id: {
+			PERMISSION_EDIT_OTHER_USERS,
+			PERMISSION_DEMOTE_TO_GUEST,
+			PERMISSION_PROMOTE_GUEST,
+		},
 		PERMISSION_SYSCONSOLE_WRITE_USERMANAGEMENT_CHANNELS.Id: {
 			PERMISSION_MANAGE_TEAM,
 			PERMISSION_MANAGE_PUBLIC_CHANNEL_PROPERTIES,
 			PERMISSION_MANAGE_PRIVATE_CHANNEL_PROPERTIES,
+			PERMISSION_MANAGE_PRIVATE_CHANNEL_MEMBERS,
+			PERMISSION_MANAGE_PUBLIC_CHANNEL_MEMBERS,
 			PERMISSION_DELETE_PRIVATE_CHANNEL,
 			PERMISSION_DELETE_PUBLIC_CHANNEL,
 			PERMISSION_MANAGE_CHANNEL_ROLES,
@@ -77,6 +88,7 @@ func init() {
 			PERMISSION_CONVERT_PRIVATE_CHANNEL_TO_PUBLIC,
 		},
 		PERMISSION_SYSCONSOLE_WRITE_USERMANAGEMENT_TEAMS.Id: {
+			PERMISSION_MANAGE_TEAM,
 			PERMISSION_MANAGE_TEAM_ROLES,
 			PERMISSION_REMOVE_USER_FROM_TEAM,
 			PERMISSION_JOIN_PRIVATE_TEAMS,
@@ -97,6 +109,60 @@ func init() {
 			PERMISSION_EDIT_BRAND,
 		},
 	}
+
+	SystemUserManagerDefaultPermissions = []string{
+		PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_GROUPS.Id,
+		PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_TEAMS.Id,
+		PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_CHANNELS.Id,
+		PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_PERMISSIONS.Id,
+		PERMISSION_SYSCONSOLE_WRITE_USERMANAGEMENT_GROUPS.Id,
+		PERMISSION_SYSCONSOLE_WRITE_USERMANAGEMENT_TEAMS.Id,
+		PERMISSION_SYSCONSOLE_WRITE_USERMANAGEMENT_CHANNELS.Id,
+		PERMISSION_SYSCONSOLE_READ_AUTHENTICATION.Id,
+	}
+
+	SystemReadOnlyAdminDefaultPermissions = []string{
+		PERMISSION_SYSCONSOLE_READ_ABOUT.Id,
+		PERMISSION_SYSCONSOLE_READ_REPORTING.Id,
+		PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_USERS.Id,
+		PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_GROUPS.Id,
+		PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_TEAMS.Id,
+		PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_CHANNELS.Id,
+		PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_PERMISSIONS.Id,
+		PERMISSION_SYSCONSOLE_READ_ENVIRONMENT.Id,
+		PERMISSION_SYSCONSOLE_READ_SITE.Id,
+		PERMISSION_SYSCONSOLE_READ_AUTHENTICATION.Id,
+		PERMISSION_SYSCONSOLE_READ_PLUGINS.Id,
+		PERMISSION_SYSCONSOLE_READ_COMPLIANCE.Id,
+		PERMISSION_SYSCONSOLE_READ_INTEGRATIONS.Id,
+		PERMISSION_SYSCONSOLE_READ_EXPERIMENTAL.Id,
+	}
+
+	SystemManagerDefaultPermissions = []string{
+		PERMISSION_SYSCONSOLE_READ_ABOUT.Id,
+		PERMISSION_SYSCONSOLE_READ_REPORTING.Id,
+		PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_GROUPS.Id,
+		PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_TEAMS.Id,
+		PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_CHANNELS.Id,
+		PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_PERMISSIONS.Id,
+		PERMISSION_SYSCONSOLE_WRITE_USERMANAGEMENT_GROUPS.Id,
+		PERMISSION_SYSCONSOLE_WRITE_USERMANAGEMENT_TEAMS.Id,
+		PERMISSION_SYSCONSOLE_WRITE_USERMANAGEMENT_CHANNELS.Id,
+		PERMISSION_SYSCONSOLE_WRITE_USERMANAGEMENT_PERMISSIONS.Id,
+		PERMISSION_SYSCONSOLE_READ_ENVIRONMENT.Id,
+		PERMISSION_SYSCONSOLE_WRITE_ENVIRONMENT.Id,
+		PERMISSION_SYSCONSOLE_READ_SITE.Id,
+		PERMISSION_SYSCONSOLE_WRITE_SITE.Id,
+		PERMISSION_SYSCONSOLE_READ_AUTHENTICATION.Id,
+		PERMISSION_SYSCONSOLE_READ_PLUGINS.Id,
+		PERMISSION_SYSCONSOLE_READ_INTEGRATIONS.Id,
+		PERMISSION_SYSCONSOLE_WRITE_INTEGRATIONS.Id,
+	}
+
+	// Add the ancillary permissions to each system role
+	SystemUserManagerDefaultPermissions = addAncillaryPermissions(SystemUserManagerDefaultPermissions)
+	SystemReadOnlyAdminDefaultPermissions = addAncillaryPermissions(SystemReadOnlyAdminDefaultPermissions)
+	SystemManagerDefaultPermissions = addAncillaryPermissions(SystemManagerDefaultPermissions)
 }
 
 type RoleType string
@@ -417,15 +483,16 @@ func (r *Role) IsValidWithoutId() bool {
 		return false
 	}
 
-	for _, permission := range r.Permissions {
-		permissionValidated := false
-		for _, p := range append(AllPermissions, DeprecatedPermissions...) {
+	check := func(perms []*Permission, permission string) bool {
+		for _, p := range perms {
 			if permission == p.Id {
-				permissionValidated = true
-				break
+				return true
 			}
 		}
-
+		return false
+	}
+	for _, permission := range r.Permissions {
+		permissionValidated := check(AllPermissions, permission) || check(DeprecatedPermissions, permission)
 		if !permissionValidated {
 			return false
 		}
@@ -652,83 +719,30 @@ func MakeDefaultRoles() map[string]*Role {
 	}
 
 	roles[SYSTEM_USER_MANAGER_ROLE_ID] = &Role{
-		Name:        "system_user_manager",
-		DisplayName: "authentication.roles.system_user_manager.name",
-		Description: "authentication.roles.system_user_manager.description",
-		Permissions: []string{
-			PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_GROUPS.Id,
-			PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_TEAMS.Id,
-			PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_CHANNELS.Id,
-			PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_PERMISSIONS.Id,
-			PERMISSION_SYSCONSOLE_WRITE_USERMANAGEMENT_GROUPS.Id,
-			PERMISSION_SYSCONSOLE_WRITE_USERMANAGEMENT_TEAMS.Id,
-			PERMISSION_SYSCONSOLE_WRITE_USERMANAGEMENT_CHANNELS.Id,
-			PERMISSION_SYSCONSOLE_READ_AUTHENTICATION.Id,
-		},
+		Name:          "system_user_manager",
+		DisplayName:   "authentication.roles.system_user_manager.name",
+		Description:   "authentication.roles.system_user_manager.description",
+		Permissions:   SystemUserManagerDefaultPermissions,
 		SchemeManaged: false,
 		BuiltIn:       true,
 	}
 
 	roles[SYSTEM_READ_ONLY_ADMIN_ROLE_ID] = &Role{
-		Name:        "system_read_only_admin",
-		DisplayName: "authentication.roles.system_read_only_admin.name",
-		Description: "authentication.roles.system_read_only_admin.description",
-		Permissions: []string{
-			PERMISSION_SYSCONSOLE_READ_ABOUT.Id,
-			PERMISSION_SYSCONSOLE_READ_REPORTING.Id,
-			PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_USERS.Id,
-			PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_GROUPS.Id,
-			PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_TEAMS.Id,
-			PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_CHANNELS.Id,
-			PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_PERMISSIONS.Id,
-			PERMISSION_SYSCONSOLE_READ_ENVIRONMENT.Id,
-			PERMISSION_SYSCONSOLE_READ_SITE.Id,
-			PERMISSION_SYSCONSOLE_READ_AUTHENTICATION.Id,
-			PERMISSION_SYSCONSOLE_READ_PLUGINS.Id,
-			PERMISSION_SYSCONSOLE_READ_INTEGRATIONS.Id,
-			PERMISSION_SYSCONSOLE_READ_EXPERIMENTAL.Id,
-		},
+		Name:          "system_read_only_admin",
+		DisplayName:   "authentication.roles.system_read_only_admin.name",
+		Description:   "authentication.roles.system_read_only_admin.description",
+		Permissions:   SystemReadOnlyAdminDefaultPermissions,
 		SchemeManaged: false,
 		BuiltIn:       true,
 	}
 
 	roles[SYSTEM_MANAGER_ROLE_ID] = &Role{
-		Name:        "system_manager",
-		DisplayName: "authentication.roles.system_manager.name",
-		Description: "authentication.roles.system_manager.description",
-		Permissions: []string{
-			PERMISSION_SYSCONSOLE_READ_ABOUT.Id,
-			PERMISSION_SYSCONSOLE_READ_REPORTING.Id,
-			PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_GROUPS.Id,
-			PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_TEAMS.Id,
-			PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_CHANNELS.Id,
-			PERMISSION_SYSCONSOLE_READ_USERMANAGEMENT_PERMISSIONS.Id,
-			PERMISSION_SYSCONSOLE_WRITE_USERMANAGEMENT_GROUPS.Id,
-			PERMISSION_SYSCONSOLE_WRITE_USERMANAGEMENT_TEAMS.Id,
-			PERMISSION_SYSCONSOLE_WRITE_USERMANAGEMENT_CHANNELS.Id,
-			PERMISSION_SYSCONSOLE_WRITE_USERMANAGEMENT_PERMISSIONS.Id,
-			PERMISSION_SYSCONSOLE_READ_ENVIRONMENT.Id,
-			PERMISSION_SYSCONSOLE_WRITE_ENVIRONMENT.Id,
-			PERMISSION_SYSCONSOLE_READ_SITE.Id,
-			PERMISSION_SYSCONSOLE_WRITE_SITE.Id,
-			PERMISSION_SYSCONSOLE_READ_AUTHENTICATION.Id,
-			PERMISSION_SYSCONSOLE_READ_PLUGINS.Id,
-			PERMISSION_SYSCONSOLE_READ_INTEGRATIONS.Id,
-			PERMISSION_SYSCONSOLE_WRITE_INTEGRATIONS.Id,
-		},
+		Name:          "system_manager",
+		DisplayName:   "authentication.roles.system_manager.name",
+		Description:   "authentication.roles.system_manager.description",
+		Permissions:   SystemManagerDefaultPermissions,
 		SchemeManaged: false,
 		BuiltIn:       true,
-	}
-
-	// Add the ancillary permissions to each new system role
-	for _, role := range []*Role{roles[SYSTEM_USER_MANAGER_ROLE_ID], roles[SYSTEM_READ_ONLY_ADMIN_ROLE_ID], roles[SYSTEM_MANAGER_ROLE_ID]} {
-		for _, rolePermission := range role.Permissions {
-			if ancillaryPermissions, ok := SysconsoleAncillaryPermissions[rolePermission]; ok {
-				for _, ancillaryPermission := range ancillaryPermissions {
-					role.Permissions = append(role.Permissions, ancillaryPermission.Id)
-				}
-			}
-		}
 	}
 
 	allPermissionIDs := []string{}
@@ -749,4 +763,15 @@ func MakeDefaultRoles() map[string]*Role {
 	}
 
 	return roles
+}
+
+func addAncillaryPermissions(permissions []string) []string {
+	for _, permission := range permissions {
+		if ancillaryPermissions, ok := SysconsoleAncillaryPermissions[permission]; ok {
+			for _, ancillaryPermission := range ancillaryPermissions {
+				permissions = append(permissions, ancillaryPermission.Id)
+			}
+		}
+	}
+	return permissions
 }

@@ -6,6 +6,7 @@ package app
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"image"
 	"image/color"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/mattermost/mattermost-server/v5/einterfaces"
 	"github.com/mattermost/mattermost-server/v5/model"
 	oauthgitlab "github.com/mattermost/mattermost-server/v5/model/gitlab"
+	"github.com/mattermost/mattermost-server/v5/store"
 	"github.com/mattermost/mattermost-server/v5/utils/testutils"
 )
 
@@ -361,6 +363,46 @@ func TestUpdateOAuthUserAttrs(t *testing.T) {
 	})
 }
 
+func TestCreateUserConflict(t *testing.T) {
+	th := Setup(t)
+	defer th.TearDown()
+
+	user := &model.User{
+		Email:    "test@localhost",
+		Username: model.NewId(),
+	}
+	user, err := th.App.Srv().Store.User().Save(user)
+	require.NoError(t, err)
+	username := user.Username
+
+	var invErr *store.ErrInvalidInput
+	// Same id
+	_, err = th.App.Srv().Store.User().Save(user)
+	require.Error(t, err)
+	require.True(t, errors.As(err, &invErr))
+	assert.Equal(t, "id", invErr.Field)
+
+	// Same email
+	user = &model.User{
+		Email:    "test@localhost",
+		Username: model.NewId(),
+	}
+	_, err = th.App.Srv().Store.User().Save(user)
+	require.Error(t, err)
+	require.True(t, errors.As(err, &invErr))
+	assert.Equal(t, "email", invErr.Field)
+
+	// Same username
+	user = &model.User{
+		Email:    "test2@localhost",
+		Username: username,
+	}
+	_, err = th.App.Srv().Store.User().Save(user)
+	require.Error(t, err)
+	require.True(t, errors.As(err, &invErr))
+	assert.Equal(t, "username", invErr.Field)
+}
+
 func TestUpdateUserEmail(t *testing.T) {
 	th := Setup(t)
 	defer th.TearDown()
@@ -398,8 +440,8 @@ func TestUpdateUserEmail(t *testing.T) {
 			Username: model.NewId(),
 			IsBot:    true,
 		}
-		_, err = th.App.Srv().Store.User().Save(&botuser)
-		assert.Nil(t, err)
+		_, nErr := th.App.Srv().Store.User().Save(&botuser)
+		assert.Nil(t, nErr)
 
 		newBotEmail := th.MakeEmail()
 		botuser.Email = newBotEmail
@@ -419,7 +461,8 @@ func TestUpdateUserEmail(t *testing.T) {
 
 		user.Email = newEmail
 		user3, err := th.App.UpdateUser(user, false)
-		assert.NotNil(t, err)
+		require.NotNil(t, err)
+		assert.Equal(t, err.Id, "store.sql_user.update.email_taken.app_error")
 		assert.Nil(t, user3)
 	})
 
@@ -441,14 +484,29 @@ func TestUpdateUserEmail(t *testing.T) {
 			Username: model.NewId(),
 			IsBot:    true,
 		}
-		_, err = th.App.Srv().Store.User().Save(&botuser)
-		assert.Nil(t, err)
+		_, nErr := th.App.Srv().Store.User().Save(&botuser)
+		assert.Nil(t, nErr)
 
 		newBotEmail := th.MakeEmail()
 		botuser.Email = newBotEmail
 		botuser2, err := th.App.UpdateUser(&botuser, false)
 		assert.Nil(t, err)
 		assert.Equal(t, botuser2.Email, newBotEmail)
+	})
+
+	t.Run("NoVerificationAlreadyUsedEmail", func(t *testing.T) {
+		th.App.UpdateConfig(func(cfg *model.Config) {
+			*cfg.EmailSettings.RequireEmailVerification = false
+		})
+
+		user2 := th.CreateUser()
+		newEmail := user2.Email
+
+		user.Email = newEmail
+		user3, err := th.App.UpdateUser(user, false)
+		require.NotNil(t, err)
+		assert.Equal(t, err.Id, "store.sql_user.update.email_taken.app_error")
+		assert.Nil(t, user3)
 	})
 }
 
@@ -528,7 +586,11 @@ func TestGetUsersByStatus(t *testing.T) {
 	onlineUser2 := createUserWithStatus("online2", model.STATUS_ONLINE)
 
 	t.Run("sorting by status then alphabetical", func(t *testing.T) {
-		usersByStatus, err := th.App.GetUsersInChannelPageByStatus(channel.Id, 0, 8, true)
+		usersByStatus, err := th.App.GetUsersInChannelPageByStatus(&model.UserGetOptions{
+			InChannelId: channel.Id,
+			Page:        0,
+			PerPage:     8,
+		}, true)
 		require.Nil(t, err)
 
 		expectedUsersByStatus := []*model.User{
@@ -550,7 +612,11 @@ func TestGetUsersByStatus(t *testing.T) {
 	})
 
 	t.Run("paging", func(t *testing.T) {
-		usersByStatus, err := th.App.GetUsersInChannelPageByStatus(channel.Id, 0, 3, true)
+		usersByStatus, err := th.App.GetUsersInChannelPageByStatus(&model.UserGetOptions{
+			InChannelId: channel.Id,
+			Page:        0,
+			PerPage:     3,
+		}, true)
 		require.Nil(t, err)
 
 		require.Equal(t, 3, len(usersByStatus), "received too many users")
@@ -563,9 +629,14 @@ func TestGetUsersByStatus(t *testing.T) {
 
 		require.Equal(t, awayUser1.Id, usersByStatus[2].Id, "expected to receive away users second")
 
-		usersByStatus, err = th.App.GetUsersInChannelPageByStatus(channel.Id, 1, 3, true)
+		usersByStatus, err = th.App.GetUsersInChannelPageByStatus(&model.UserGetOptions{
+			InChannelId: channel.Id,
+			Page:        1,
+			PerPage:     3,
+		}, true)
 		require.Nil(t, err)
 
+		require.NotEmpty(t, usersByStatus, "at least some users are expected")
 		require.Equal(t, awayUser2.Id, usersByStatus[0].Id, "expected to receive away users second")
 
 		require.False(
@@ -574,7 +645,11 @@ func TestGetUsersByStatus(t *testing.T) {
 			"expected to receive dnd users third",
 		)
 
-		usersByStatus, err = th.App.GetUsersInChannelPageByStatus(channel.Id, 1, 4, true)
+		usersByStatus, err = th.App.GetUsersInChannelPageByStatus(&model.UserGetOptions{
+			InChannelId: channel.Id,
+			Page:        1,
+			PerPage:     4,
+		}, true)
 		require.Nil(t, err)
 
 		require.Equal(t, 4, len(usersByStatus), "received too many users")

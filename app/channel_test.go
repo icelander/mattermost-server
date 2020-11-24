@@ -596,8 +596,8 @@ func TestAddChannelMemberNoUserRequestor(t *testing.T) {
 	}
 	assert.Equal(t, groupUserIds, channelMemberHistoryUserIds)
 
-	postList, err := th.App.Srv().Store.Post().GetPosts(model.GetPostsOptions{ChannelId: channel.Id, Page: 0, PerPage: 1}, false)
-	require.Nil(t, err)
+	postList, nErr := th.App.Srv().Store.Post().GetPosts(model.GetPostsOptions{ChannelId: channel.Id, Page: 0, PerPage: 1}, false)
+	require.Nil(t, nErr)
 
 	if assert.Len(t, postList.Order, 1) {
 		post := postList.Posts[postList.Order[0]]
@@ -622,6 +622,57 @@ func TestAppUpdateChannelScheme(t *testing.T) {
 	if updatedChannel.SchemeId != mockID {
 		require.Fail(t, "Wrong Channel SchemeId")
 	}
+}
+
+func TestSetChannelsMuted(t *testing.T) {
+	t.Run("should mute and unmute the given channels", func(t *testing.T) {
+		th := Setup(t).InitBasic()
+		defer th.TearDown()
+
+		channel1 := th.BasicChannel
+
+		channel2 := th.CreateChannel(th.BasicTeam)
+		th.AddUserToChannel(th.BasicUser, channel2)
+
+		// Ensure that both channels start unmuted
+		member1, err := th.App.GetChannelMember(channel1.Id, th.BasicUser.Id)
+		require.Nil(t, err)
+		require.False(t, member1.IsChannelMuted())
+
+		member2, err := th.App.GetChannelMember(channel2.Id, th.BasicUser.Id)
+		require.Nil(t, err)
+		require.False(t, member2.IsChannelMuted())
+
+		// Mute both channels
+		updated, err := th.App.setChannelsMuted([]string{channel1.Id, channel2.Id}, th.BasicUser.Id, true)
+		require.Nil(t, err)
+		assert.True(t, updated[0].IsChannelMuted())
+		assert.True(t, updated[1].IsChannelMuted())
+
+		// Verify that the channels are muted in the database
+		member1, err = th.App.GetChannelMember(channel1.Id, th.BasicUser.Id)
+		require.Nil(t, err)
+		require.True(t, member1.IsChannelMuted())
+
+		member2, err = th.App.GetChannelMember(channel2.Id, th.BasicUser.Id)
+		require.Nil(t, err)
+		require.True(t, member2.IsChannelMuted())
+
+		// Unm both channels
+		updated, err = th.App.setChannelsMuted([]string{channel1.Id, channel2.Id}, th.BasicUser.Id, false)
+		require.Nil(t, err)
+		assert.False(t, updated[0].IsChannelMuted())
+		assert.False(t, updated[1].IsChannelMuted())
+
+		// Verify that the channels are muted in the database
+		member1, err = th.App.GetChannelMember(channel1.Id, th.BasicUser.Id)
+		require.Nil(t, err)
+		require.False(t, member1.IsChannelMuted())
+
+		member2, err = th.App.GetChannelMember(channel2.Id, th.BasicUser.Id)
+		require.Nil(t, err)
+		require.False(t, member2.IsChannelMuted())
+	})
 }
 
 func TestFillInChannelProps(t *testing.T) {
@@ -1828,15 +1879,15 @@ func TestPatchChannelModerationsForChannel(t *testing.T) {
 		wg.Add(20)
 		for i := 0; i < 10; i++ {
 			go func() {
-				th.App.PatchChannelModerationsForChannel(channel, addCreatePosts)
-				th.App.PatchChannelModerationsForChannel(channel, removeCreatePosts)
+				th.App.PatchChannelModerationsForChannel(channel.DeepCopy(), addCreatePosts)
+				th.App.PatchChannelModerationsForChannel(channel.DeepCopy(), removeCreatePosts)
 				wg.Done()
 			}()
 		}
 		for i := 0; i < 10; i++ {
 			go func() {
-				th.App.PatchChannelModerationsForChannel(channel, addCreatePosts)
-				th.App.PatchChannelModerationsForChannel(channel, removeCreatePosts)
+				th.App.PatchChannelModerationsForChannel(channel.DeepCopy(), addCreatePosts)
+				th.App.PatchChannelModerationsForChannel(channel.DeepCopy(), removeCreatePosts)
 				wg.Done()
 			}()
 		}
@@ -1859,7 +1910,7 @@ func TestMarkChannelsAsViewedPanic(t *testing.T) {
 
 	mockStore := th.App.Srv().Store.(*mocks.Store)
 	mockUserStore := mocks.UserStore{}
-	mockUserStore.On("Get", "userID").Return(nil, model.NewAppError("SqlUserStore.Get", "store.sql_user.get.app_error", nil, "user_id=userID", http.StatusInternalServerError))
+	mockUserStore.On("Get", "userID").Return(nil, model.NewAppError("SqlUserStore.Get", "app.user.get.app_error", nil, "user_id=userID", http.StatusInternalServerError))
 	mockChannelStore := mocks.ChannelStore{}
 	mockChannelStore.On("Get", "channelID", true).Return(&model.Channel{}, nil)
 	mockChannelStore.On("GetMember", "channelID", "userID").Return(&model.ChannelMember{
@@ -1869,7 +1920,7 @@ func TestMarkChannelsAsViewedPanic(t *testing.T) {
 	times := map[string]int64{
 		"userID": 1,
 	}
-	mockChannelStore.On("UpdateLastViewedAt", []string{"channelID"}, "userID").Return(times, nil)
+	mockChannelStore.On("UpdateLastViewedAt", []string{"channelID"}, "userID", true).Return(times, nil)
 	mockStore.On("User").Return(&mockUserStore)
 	mockStore.On("Channel").Return(&mockChannelStore)
 
@@ -1897,4 +1948,25 @@ func TestClearChannelMembersCache(t *testing.T) {
 	mockStore.On("Channel").Return(&mockChannelStore)
 
 	th.App.ClearChannelMembersCache("channelID")
+}
+
+func TestGetMemberCountsByGroup(t *testing.T) {
+	th := SetupWithStoreMock(t)
+	defer th.TearDown()
+
+	mockStore := th.App.Srv().Store.(*mocks.Store)
+	mockChannelStore := mocks.ChannelStore{}
+	cmc := []*model.ChannelMemberCountByGroup{}
+	for i := 0; i < 5; i++ {
+		cmc = append(cmc, &model.ChannelMemberCountByGroup{
+			GroupId:                     model.NewId(),
+			ChannelMemberCount:          int64(i),
+			ChannelMemberTimezonesCount: int64(i),
+		})
+	}
+	mockChannelStore.On("GetMemberCountsByGroup", "channelID", true).Return(cmc, nil)
+	mockStore.On("Channel").Return(&mockChannelStore)
+	resp, err := th.App.GetMemberCountsByGroup("channelID", true)
+	require.Nil(t, err)
+	require.ElementsMatch(t, cmc, resp)
 }
