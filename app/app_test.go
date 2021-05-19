@@ -4,6 +4,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"testing"
@@ -180,10 +181,12 @@ func TestDoAdvancedPermissionsMigration(t *testing.T) {
 		},
 		"system_admin": allPermissionIDs,
 	}
+	assert.Contains(t, allPermissionIDs, model.PERMISSION_MANAGE_SHARED_CHANNELS.Id, "manage_shared_channels permission not found")
+	assert.Contains(t, allPermissionIDs, model.PERMISSION_MANAGE_SECURE_CONNECTIONS.Id, "manage_secure_connections permission not found")
 
 	// Check the migration matches what's expected.
 	for name, permissions := range expected1 {
-		role, err := th.App.GetRoleByName(name)
+		role, err := th.App.GetRoleByName(context.Background(), name)
 		assert.Nil(t, err)
 		assert.Equal(t, role.Permissions, permissions, fmt.Sprintf("role %q didn't match", name))
 	}
@@ -216,7 +219,7 @@ func TestDoAdvancedPermissionsMigration(t *testing.T) {
 	assert.Equal(t, len(roles2), len(roleNames))
 
 	for name, permissions := range expected1 {
-		role, err := th.App.GetRoleByName(name)
+		role, err := th.App.GetRoleByName(context.Background(), name)
 		assert.Nil(t, err)
 		assert.Equal(t, permissions, role.Permissions)
 	}
@@ -315,7 +318,7 @@ func TestDoAdvancedPermissionsMigration(t *testing.T) {
 	assert.Equal(t, len(roles3), len(roleNames))
 
 	for name, permissions := range expected2 {
-		role, err := th.App.GetRoleByName(name)
+		role, err := th.App.GetRoleByName(context.Background(), name)
 		assert.Nil(t, err)
 		assert.Equal(t, permissions, role.Permissions, fmt.Sprintf("'%v' did not have expected permissions", name))
 	}
@@ -333,7 +336,7 @@ func TestDoAdvancedPermissionsMigration(t *testing.T) {
 	assert.Equal(t, len(roles4), len(roleNames))
 
 	for name, permissions := range expected1 {
-		role, err := th.App.GetRoleByName(name)
+		role, err := th.App.GetRoleByName(context.Background(), name)
 		assert.Nil(t, err)
 		assert.Equal(t, permissions, role.Permissions)
 	}
@@ -372,7 +375,7 @@ func TestDoAdvancedPermissionsMigration(t *testing.T) {
 }
 
 func TestDoEmojisPermissionsMigration(t *testing.T) {
-	th := Setup(t)
+	th := SetupWithoutPreloadMigrations(t)
 	defer th.TearDown()
 
 	// Add a license and change the policy config.
@@ -394,7 +397,7 @@ func TestDoEmojisPermissionsMigration(t *testing.T) {
 	expectedSystemAdmin := allPermissionIDs
 	sort.Strings(expectedSystemAdmin)
 
-	role1, err1 := th.App.GetRoleByName(model.SYSTEM_ADMIN_ROLE_ID)
+	role1, err1 := th.App.GetRoleByName(context.Background(), model.SYSTEM_ADMIN_ROLE_ID)
 	assert.Nil(t, err1)
 	sort.Strings(role1.Permissions)
 	assert.Equal(t, expectedSystemAdmin, role1.Permissions, fmt.Sprintf("'%v' did not have expected permissions", model.SYSTEM_ADMIN_ROLE_ID))
@@ -406,7 +409,7 @@ func TestDoEmojisPermissionsMigration(t *testing.T) {
 	th.ResetEmojisMigration()
 	th.App.DoEmojisPermissionsMigration()
 
-	role2, err2 := th.App.GetRoleByName(model.TEAM_ADMIN_ROLE_ID)
+	role2, err2 := th.App.GetRoleByName(context.Background(), model.TEAM_ADMIN_ROLE_ID)
 	assert.Nil(t, err2)
 	expected2 := []string{
 		model.PERMISSION_REMOVE_USER_FROM_TEAM.Id,
@@ -440,7 +443,7 @@ func TestDoEmojisPermissionsMigration(t *testing.T) {
 	sort.Strings(role2.Permissions)
 	assert.Equal(t, expected2, role2.Permissions, fmt.Sprintf("'%v' did not have expected permissions", model.TEAM_ADMIN_ROLE_ID))
 
-	systemAdmin1, systemAdminErr1 := th.App.GetRoleByName(model.SYSTEM_ADMIN_ROLE_ID)
+	systemAdmin1, systemAdminErr1 := th.App.GetRoleByName(context.Background(), model.SYSTEM_ADMIN_ROLE_ID)
 	assert.Nil(t, systemAdminErr1)
 	sort.Strings(systemAdmin1.Permissions)
 	assert.Equal(t, expectedSystemAdmin, systemAdmin1.Permissions, fmt.Sprintf("'%v' did not have expected permissions", model.SYSTEM_ADMIN_ROLE_ID))
@@ -452,7 +455,7 @@ func TestDoEmojisPermissionsMigration(t *testing.T) {
 	th.ResetEmojisMigration()
 	th.App.DoEmojisPermissionsMigration()
 
-	role3, err3 := th.App.GetRoleByName(model.SYSTEM_USER_ROLE_ID)
+	role3, err3 := th.App.GetRoleByName(context.Background(), model.SYSTEM_USER_ROLE_ID)
 	assert.Nil(t, err3)
 	expected3 := []string{
 		model.PERMISSION_LIST_PUBLIC_TEAMS.Id,
@@ -468,8 +471,32 @@ func TestDoEmojisPermissionsMigration(t *testing.T) {
 	sort.Strings(role3.Permissions)
 	assert.Equal(t, expected3, role3.Permissions, fmt.Sprintf("'%v' did not have expected permissions", model.SYSTEM_USER_ROLE_ID))
 
-	systemAdmin2, systemAdminErr2 := th.App.GetRoleByName(model.SYSTEM_ADMIN_ROLE_ID)
+	systemAdmin2, systemAdminErr2 := th.App.GetRoleByName(context.Background(), model.SYSTEM_ADMIN_ROLE_ID)
 	assert.Nil(t, systemAdminErr2)
 	sort.Strings(systemAdmin2.Permissions)
 	assert.Equal(t, expectedSystemAdmin, systemAdmin2.Permissions, fmt.Sprintf("'%v' did not have expected permissions", model.SYSTEM_ADMIN_ROLE_ID))
+}
+
+func TestDBHealthCheckWriteAndDelete(t *testing.T) {
+	th := Setup(t)
+	defer th.TearDown()
+
+	expectedKey := "health_check_" + th.App.GetClusterId()
+	assert.Equal(t, expectedKey, th.App.dbHealthCheckKey())
+
+	_, err := th.App.Srv().Store.System().GetByName(expectedKey)
+	assert.Error(t, err)
+
+	err = th.App.DBHealthCheckWrite()
+	assert.NoError(t, err)
+
+	systemVal, err := th.App.Srv().Store.System().GetByName(expectedKey)
+	assert.NoError(t, err)
+	assert.NotNil(t, systemVal)
+
+	err = th.App.DBHealthCheckDelete()
+	assert.NoError(t, err)
+
+	_, err = th.App.Srv().Store.System().GetByName(expectedKey)
+	assert.Error(t, err)
 }

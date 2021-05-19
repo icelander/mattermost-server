@@ -4,12 +4,14 @@
 package telemetry
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"encoding/json"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,13 +19,13 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
-	"github.com/mattermost/mattermost-server/v5/mlog"
 	"github.com/mattermost/mattermost-server/v5/model"
 	"github.com/mattermost/mattermost-server/v5/plugin"
 	"github.com/mattermost/mattermost-server/v5/plugin/plugintest"
 	"github.com/mattermost/mattermost-server/v5/services/httpservice"
 	"github.com/mattermost/mattermost-server/v5/services/searchengine"
 	"github.com/mattermost/mattermost-server/v5/services/telemetry/mocks"
+	"github.com/mattermost/mattermost-server/v5/shared/mlog"
 	storeMocks "github.com/mattermost/mattermost-server/v5/store/storetest/mocks"
 )
 
@@ -54,19 +56,22 @@ func initializeMocks(cfg *model.Config) (*mocks.ServerIface, *storeMocks.Store, 
 	serverIfaceMock.On("GetPluginsEnvironment").Return(pluginEnv, nil)
 
 	serverIfaceMock.On("License").Return(model.NewTestLicense(), nil)
-	serverIfaceMock.On("GetRoleByName", "system_admin").Return(&model.Role{Permissions: []string{"sa-test1", "sa-test2"}}, nil)
-	serverIfaceMock.On("GetRoleByName", "system_user").Return(&model.Role{Permissions: []string{"su-test1", "su-test2"}}, nil)
-	serverIfaceMock.On("GetRoleByName", "team_admin").Return(&model.Role{Permissions: []string{"ta-test1", "ta-test2"}}, nil)
-	serverIfaceMock.On("GetRoleByName", "team_user").Return(&model.Role{Permissions: []string{"tu-test1", "tu-test2"}}, nil)
-	serverIfaceMock.On("GetRoleByName", "team_guest").Return(&model.Role{Permissions: []string{"tg-test1", "tg-test2"}}, nil)
-	serverIfaceMock.On("GetRoleByName", "channel_admin").Return(&model.Role{Permissions: []string{"ca-test1", "ca-test2"}}, nil)
-	serverIfaceMock.On("GetRoleByName", "channel_user").Return(&model.Role{Permissions: []string{"cu-test1", "cu-test2"}}, nil)
-	serverIfaceMock.On("GetRoleByName", "channel_guest").Return(&model.Role{Permissions: []string{"cg-test1", "cg-test2"}}, nil)
+	serverIfaceMock.On("GetRoleByName", context.Background(), "system_admin").Return(&model.Role{Permissions: []string{"sa-test1", "sa-test2"}}, nil)
+	serverIfaceMock.On("GetRoleByName", context.Background(), "system_user").Return(&model.Role{Permissions: []string{"su-test1", "su-test2"}}, nil)
+	serverIfaceMock.On("GetRoleByName", context.Background(), "system_user_manager").Return(&model.Role{Permissions: []string{"sum-test1", "sum-test2"}}, nil)
+	serverIfaceMock.On("GetRoleByName", context.Background(), "system_manager").Return(&model.Role{Permissions: []string{"sm-test1", "sm-test2"}}, nil)
+	serverIfaceMock.On("GetRoleByName", context.Background(), "system_read_only_admin").Return(&model.Role{Permissions: []string{"sra-test1", "sra-test2"}}, nil)
+	serverIfaceMock.On("GetRoleByName", context.Background(), "team_admin").Return(&model.Role{Permissions: []string{"ta-test1", "ta-test2"}}, nil)
+	serverIfaceMock.On("GetRoleByName", context.Background(), "team_user").Return(&model.Role{Permissions: []string{"tu-test1", "tu-test2"}}, nil)
+	serverIfaceMock.On("GetRoleByName", context.Background(), "team_guest").Return(&model.Role{Permissions: []string{"tg-test1", "tg-test2"}}, nil)
+	serverIfaceMock.On("GetRoleByName", context.Background(), "channel_admin").Return(&model.Role{Permissions: []string{"ca-test1", "ca-test2"}}, nil)
+	serverIfaceMock.On("GetRoleByName", context.Background(), "channel_user").Return(&model.Role{Permissions: []string{"cu-test1", "cu-test2"}}, nil)
+	serverIfaceMock.On("GetRoleByName", context.Background(), "channel_guest").Return(&model.Role{Permissions: []string{"cg-test1", "cg-test2"}}, nil)
 	serverIfaceMock.On("GetSchemes", "team", 0, 100).Return([]*model.Scheme{}, nil)
 	serverIfaceMock.On("HttpService").Return(httpservice.MakeHTTPService(configService))
 
 	storeMock := &storeMocks.Store{}
-	storeMock.On("GetDbVersion").Return("5.24.0", nil)
+	storeMock.On("GetDbVersion", false).Return("5.24.0", nil)
 
 	systemStore := storeMocks.SystemStore{}
 	props := model.StringMap{}
@@ -78,13 +83,16 @@ func initializeMocks(cfg *model.Config) (*mocks.ServerIface, *storeMocks.Store, 
 	userStore := storeMocks.UserStore{}
 	userStore.On("Count", model.UserCountOptions{IncludeBotAccounts: false, IncludeDeleted: true, ExcludeRegularUsers: false, TeamId: "", ViewRestrictions: nil}).Return(int64(10), nil)
 	userStore.On("Count", model.UserCountOptions{IncludeBotAccounts: true, IncludeDeleted: false, ExcludeRegularUsers: true, TeamId: "", ViewRestrictions: nil}).Return(int64(100), nil)
+	userStore.On("Count", model.UserCountOptions{Roles: []string{model.SYSTEM_MANAGER_ROLE_ID}}).Return(int64(5), nil)
+	userStore.On("Count", model.UserCountOptions{Roles: []string{model.SYSTEM_USER_MANAGER_ROLE_ID}}).Return(int64(10), nil)
+	userStore.On("Count", model.UserCountOptions{Roles: []string{model.SYSTEM_READ_ONLY_ADMIN_ROLE_ID}}).Return(int64(15), nil)
 	userStore.On("AnalyticsGetGuestCount").Return(int64(11), nil)
 	userStore.On("AnalyticsActiveCount", mock.Anything, model.UserCountOptions{IncludeBotAccounts: false, IncludeDeleted: false, ExcludeRegularUsers: false, TeamId: "", ViewRestrictions: nil}).Return(int64(5), nil)
 	userStore.On("AnalyticsGetInactiveUsersCount").Return(int64(8), nil)
 	userStore.On("AnalyticsGetSystemAdminCount").Return(int64(9), nil)
 
 	teamStore := storeMocks.TeamStore{}
-	teamStore.On("AnalyticsTeamCount", false).Return(int64(3), nil)
+	teamStore.On("AnalyticsTeamCount", (*model.TeamSearch)(nil)).Return(int64(3), nil)
 	teamStore.On("GroupSyncedTeamCount").Return(int64(16), nil)
 
 	channelStore := storeMocks.ChannelStore{}
@@ -260,7 +268,7 @@ func TestRudderTelemetry(t *testing.T) {
 	telemetryService := New(serverIfaceMock, storeMock, searchengine.NewBroker(cfg, nil), mlog.NewLogger(&mlog.LoggerConfiguration{}))
 	telemetryService.TelemetryID = telemetryID
 	telemetryService.rudderClient = nil
-	telemetryService.initRudder(server.URL, "")
+	telemetryService.initRudder(server.URL, RudderKey)
 
 	assertPayload := func(t *testing.T, actual payload, event string, properties map[string]interface{}) {
 		t.Helper()
@@ -278,7 +286,7 @@ func TestRudderTelemetry(t *testing.T) {
 			}
 		}
 		assert.Equal(t, "analytics-go", actual.Context.Library.Name)
-		assert.Equal(t, "3.0.0", actual.Context.Library.Version)
+		assert.Equal(t, "3.3.0", actual.Context.Library.Version)
 	}
 
 	collectInfo := func(info *[]string) {
@@ -339,32 +347,33 @@ func TestRudderTelemetry(t *testing.T) {
 		collectInfo(&info)
 
 		for _, item := range []string{
-			TRACK_CONFIG_SERVICE,
-			TRACK_CONFIG_TEAM,
-			TRACK_CONFIG_SQL,
-			TRACK_CONFIG_LOG,
-			TRACK_CONFIG_NOTIFICATION_LOG,
-			TRACK_CONFIG_FILE,
-			TRACK_CONFIG_RATE,
-			TRACK_CONFIG_EMAIL,
-			TRACK_CONFIG_PRIVACY,
-			TRACK_CONFIG_OAUTH,
-			TRACK_CONFIG_LDAP,
-			TRACK_CONFIG_COMPLIANCE,
-			TRACK_CONFIG_LOCALIZATION,
-			TRACK_CONFIG_SAML,
-			TRACK_CONFIG_PASSWORD,
-			TRACK_CONFIG_CLUSTER,
-			TRACK_CONFIG_METRICS,
-			TRACK_CONFIG_SUPPORT,
-			TRACK_CONFIG_NATIVEAPP,
-			TRACK_CONFIG_EXPERIMENTAL,
-			TRACK_CONFIG_ANALYTICS,
-			TRACK_CONFIG_PLUGIN,
-			TRACK_ACTIVITY,
-			TRACK_SERVER,
-			TRACK_CONFIG_MESSAGE_EXPORT,
-			TRACK_PLUGINS,
+			TrackConfigService,
+			TrackConfigTeam,
+			TrackConfigSQL,
+			TrackConfigLog,
+			TrackConfigNotificationLog,
+			TrackConfigFile,
+			TrackConfigRate,
+			TrackConfigEmail,
+			TrackConfigPrivacy,
+			TrackConfigOauth,
+			TrackConfigLDAP,
+			TrackConfigCompliance,
+			TrackConfigLocalization,
+			TrackConfigSAML,
+			TrackConfigPassword,
+			TrackConfigCluster,
+			TrackConfigMetrics,
+			TrackConfigSupport,
+			TrackConfigNativeApp,
+			TrackConfigExperimental,
+			TrackConfigAnalytics,
+			TrackConfigPlugin,
+			TrackFeatureFlags,
+			TrackActivity,
+			TrackServer,
+			TrackConfigMessageExport,
+			TrackPlugins,
 		} {
 			require.Contains(t, info, item)
 		}
@@ -381,32 +390,33 @@ func TestRudderTelemetry(t *testing.T) {
 		collectInfo(&info)
 
 		for _, item := range []string{
-			TRACK_CONFIG_SERVICE,
-			TRACK_CONFIG_TEAM,
-			TRACK_CONFIG_SQL,
-			TRACK_CONFIG_LOG,
-			TRACK_CONFIG_NOTIFICATION_LOG,
-			TRACK_CONFIG_FILE,
-			TRACK_CONFIG_RATE,
-			TRACK_CONFIG_EMAIL,
-			TRACK_CONFIG_PRIVACY,
-			TRACK_CONFIG_OAUTH,
-			TRACK_CONFIG_LDAP,
-			TRACK_CONFIG_COMPLIANCE,
-			TRACK_CONFIG_LOCALIZATION,
-			TRACK_CONFIG_SAML,
-			TRACK_CONFIG_PASSWORD,
-			TRACK_CONFIG_CLUSTER,
-			TRACK_CONFIG_METRICS,
-			TRACK_CONFIG_SUPPORT,
-			TRACK_CONFIG_NATIVEAPP,
-			TRACK_CONFIG_EXPERIMENTAL,
-			TRACK_CONFIG_ANALYTICS,
-			TRACK_CONFIG_PLUGIN,
-			TRACK_ACTIVITY,
-			TRACK_SERVER,
-			TRACK_CONFIG_MESSAGE_EXPORT,
-			TRACK_PLUGINS,
+			TrackConfigService,
+			TrackConfigTeam,
+			TrackConfigSQL,
+			TrackConfigLog,
+			TrackConfigNotificationLog,
+			TrackConfigFile,
+			TrackConfigRate,
+			TrackConfigEmail,
+			TrackConfigPrivacy,
+			TrackConfigOauth,
+			TrackConfigLDAP,
+			TrackConfigCompliance,
+			TrackConfigLocalization,
+			TrackConfigSAML,
+			TrackConfigPassword,
+			TrackConfigCluster,
+			TrackConfigMetrics,
+			TrackConfigSupport,
+			TrackConfigNativeApp,
+			TrackConfigExperimental,
+			TrackConfigAnalytics,
+			TrackConfigPlugin,
+			TrackFeatureFlags,
+			TrackActivity,
+			TrackServer,
+			TrackConfigMessageExport,
+			TrackPlugins,
 		} {
 			require.Contains(t, info, item)
 		}
@@ -418,7 +428,7 @@ func TestRudderTelemetry(t *testing.T) {
 		collectBatches(&batches)
 
 		for _, b := range batches {
-			if b.Event == TRACK_CONFIG_PLUGIN {
+			if b.Event == TrackConfigPlugin {
 				assert.Contains(t, b.Properties, "enable_testplugin")
 				assert.Contains(t, b.Properties, "version_testplugin")
 
@@ -436,7 +446,7 @@ func TestRudderTelemetry(t *testing.T) {
 		collectBatches(&batches)
 
 		for _, b := range batches {
-			if b.Event == TRACK_CONFIG_PLUGIN {
+			if b.Event == TrackConfigPlugin {
 				assert.NotContains(t, b.Properties, "enable_testplugin")
 				assert.NotContains(t, b.Properties, "version_testplugin")
 
@@ -448,6 +458,9 @@ func TestRudderTelemetry(t *testing.T) {
 	})
 
 	t.Run("SendDailyTelemetryNoRudderKey", func(t *testing.T) {
+		if !strings.Contains(RudderKey, "placeholder") {
+			t.Skipf("Skipping telemetry on production builds")
+		}
 		telemetryService.sendDailyTelemetry(false)
 
 		select {
@@ -459,6 +472,9 @@ func TestRudderTelemetry(t *testing.T) {
 	})
 
 	t.Run("SendDailyTelemetryDisabled", func(t *testing.T) {
+		if !strings.Contains(RudderKey, "placeholder") {
+			t.Skipf("Skipping telemetry on production builds")
+		}
 		*cfg.LogSettings.EnableDiagnostics = false
 		defer func() {
 			*cfg.LogSettings.EnableDiagnostics = true
@@ -473,4 +489,51 @@ func TestRudderTelemetry(t *testing.T) {
 			// Did not receive telemetry
 		}
 	})
+
+	t.Run("TestInstallationType", func(t *testing.T) {
+		os.Unsetenv(EnvVarInstallType)
+		telemetryService.sendDailyTelemetry(true)
+
+		var batches []batch
+		collectBatches(&batches)
+
+		for _, b := range batches {
+			if b.Event == TrackServer {
+				assert.Equal(t, b.Properties["installation_type"], "")
+			}
+		}
+
+		os.Setenv(EnvVarInstallType, "docker")
+		defer os.Unsetenv(EnvVarInstallType)
+
+		batches = []batch{}
+		collectBatches(&batches)
+
+		for _, b := range batches {
+			if b.Event == TrackServer {
+				assert.Equal(t, b.Properties["installation_type"], "docker")
+			}
+		}
+	})
+
+	t.Run("RudderConfigUsesConfigForValues", func(t *testing.T) {
+		if !strings.Contains(RudderKey, "placeholder") {
+			t.Skipf("Skipping telemetry on production builds")
+		}
+		os.Setenv("RudderKey", "abc123")
+		os.Setenv("RudderDataplaneURL", "arudderstackplace")
+		defer os.Unsetenv("RudderKey")
+		defer os.Unsetenv("RudderDataplaneURL")
+
+		config := telemetryService.getRudderConfig()
+
+		assert.Equal(t, "arudderstackplace", config.DataplaneUrl)
+		assert.Equal(t, "abc123", config.RudderKey)
+	})
+}
+
+func TestIsDefaultArray(t *testing.T) {
+	assert.True(t, isDefaultArray([]string{"one", "two"}, []string{"one", "two"}))
+	assert.False(t, isDefaultArray([]string{"one", "two"}, []string{"one", "two", "three"}))
+	assert.False(t, isDefaultArray([]string{"one", "two"}, []string{"one", "three"}))
 }

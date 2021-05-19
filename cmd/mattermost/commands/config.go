@@ -11,13 +11,13 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/mattermost/viper"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 
 	"github.com/mattermost/mattermost-server/v5/config"
-	"github.com/mattermost/mattermost-server/v5/mlog"
 	"github.com/mattermost/mattermost-server/v5/model"
+	"github.com/mattermost/mattermost-server/v5/shared/i18n"
+	"github.com/mattermost/mattermost-server/v5/shared/mlog"
 	"github.com/mattermost/mattermost-server/v5/utils"
 )
 
@@ -107,7 +107,7 @@ func init() {
 
 func configValidateCmdF(command *cobra.Command, args []string) error {
 	utils.TranslationsPreInit()
-	model.AppErrorInit(utils.T)
+	model.AppErrorInit(i18n.T)
 
 	_, err := getConfigStore(command)
 	if err != nil {
@@ -141,14 +141,12 @@ func configSubpathCmdF(command *cobra.Command, args []string) error {
 	return nil
 }
 
-func getConfigStore(command *cobra.Command) (config.Store, error) {
+func getConfigStore(command *cobra.Command) (*config.Store, error) {
 	if err := utils.TranslationsPreInit(); err != nil {
 		return nil, errors.Wrap(err, "failed to initialize i18n")
 	}
 
-	configDSN := viper.GetString("config")
-
-	configStore, err := config.NewStore(configDSN, false)
+	configStore, err := config.NewStoreFromDSN(getConfigDSN(command, config.GetEnvironment()), false, false, nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to initialize config store")
 	}

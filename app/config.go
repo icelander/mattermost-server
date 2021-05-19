@@ -14,20 +14,21 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"runtime/debug"
+	"reflect"
 	"strconv"
 	"time"
 
 	"github.com/pkg/errors"
 
 	"github.com/mattermost/mattermost-server/v5/config"
-	"github.com/mattermost/mattermost-server/v5/mlog"
 	"github.com/mattermost/mattermost-server/v5/model"
+	"github.com/mattermost/mattermost-server/v5/shared/mail"
+	"github.com/mattermost/mattermost-server/v5/shared/mlog"
 	"github.com/mattermost/mattermost-server/v5/utils"
 )
 
 const (
-	ERROR_TERMS_OF_SERVICE_NO_ROWS_FOUND = "app.terms_of_service.get.no_rows.app_error"
+	ErrorTermsOfServiceNoRowsFound = "app.terms_of_service.get.no_rows.app_error"
 )
 
 func (s *Server) Config() *model.Config {
@@ -38,15 +39,18 @@ func (a *App) Config() *model.Config {
 	return a.Srv().Config()
 }
 
-func (s *Server) EnvironmentConfig() map[string]interface{} {
-	return s.configStore.GetEnvironmentOverrides()
+func (s *Server) EnvironmentConfig(filter func(reflect.StructField) bool) map[string]interface{} {
+	return s.configStore.GetEnvironmentOverridesWithFilter(filter)
 }
 
-func (a *App) EnvironmentConfig() map[string]interface{} {
-	return a.Srv().EnvironmentConfig()
+func (a *App) EnvironmentConfig(filter func(reflect.StructField) bool) map[string]interface{} {
+	return a.Srv().EnvironmentConfig(filter)
 }
 
 func (s *Server) UpdateConfig(f func(*model.Config)) {
+	if s.configStore.IsReadOnly() {
+		return
+	}
 	old := s.Config()
 	updated := old.Clone()
 	f(updated)
@@ -60,7 +64,6 @@ func (a *App) UpdateConfig(f func(*model.Config)) {
 }
 
 func (s *Server) ReloadConfig() error {
-	debug.FreeOSMemory()
 	if err := s.configStore.Load(); err != nil {
 		return err
 	}
@@ -140,7 +143,7 @@ func (s *Server) ensurePostActionCookieSecret() error {
 		system.Value = string(v)
 		// If we were able to save the key, use it, otherwise log the error.
 		if err = s.Store.System().Save(system); err != nil {
-			mlog.Error("Failed to save PostActionCookieSecret", mlog.Err(err))
+			mlog.Warn("Failed to save PostActionCookieSecret", mlog.Err(err))
 		} else {
 			secret = newSecret
 		}
@@ -166,7 +169,7 @@ func (s *Server) ensurePostActionCookieSecret() error {
 // ensureAsymmetricSigningKey ensures that an asymmetric signing key exists and future calls to
 // AsymmetricSigningKey will always return a valid signing key.
 func (s *Server) ensureAsymmetricSigningKey() error {
-	if s.asymmetricSigningKey != nil {
+	if s.AsymmetricSigningKey() != nil {
 		return nil
 	}
 
@@ -203,7 +206,7 @@ func (s *Server) ensureAsymmetricSigningKey() error {
 		system.Value = string(v)
 		// If we were able to save the key, use it, otherwise log the error.
 		if err = s.Store.System().Save(system); err != nil {
-			mlog.Error("Failed to save AsymmetricSigningKey", mlog.Err(err))
+			mlog.Warn("Failed to save AsymmetricSigningKey", mlog.Err(err))
 		} else {
 			key = newKey
 		}
@@ -229,14 +232,14 @@ func (s *Server) ensureAsymmetricSigningKey() error {
 	default:
 		return fmt.Errorf("unknown curve: " + key.ECDSAKey.Curve)
 	}
-	s.asymmetricSigningKey = &ecdsa.PrivateKey{
+	s.asymmetricSigningKey.Store(&ecdsa.PrivateKey{
 		PublicKey: ecdsa.PublicKey{
 			Curve: curve,
 			X:     key.ECDSAKey.X,
 			Y:     key.ECDSAKey.Y,
 		},
 		D: key.ECDSAKey.D,
-	}
+	})
 	s.regenerateClientConfig()
 	return nil
 }
@@ -247,9 +250,9 @@ func (s *Server) ensureInstallationDate() error {
 		return nil
 	}
 
-	installDate, appErr := s.Store.User().InferSystemInstallDate()
+	installDate, nErr := s.Store.User().InferSystemInstallDate()
 	var installationDate int64
-	if appErr == nil && installDate > 0 {
+	if nErr == nil && installDate > 0 {
 		installationDate = installDate
 	} else {
 		installationDate = utils.MillisFromTime(time.Now())
@@ -281,7 +284,10 @@ func (s *Server) ensureFirstServerRunTimestamp() error {
 
 // AsymmetricSigningKey will return a private key that can be used for asymmetric signing.
 func (s *Server) AsymmetricSigningKey() *ecdsa.PrivateKey {
-	return s.asymmetricSigningKey
+	if key := s.asymmetricSigningKey.Load(); key != nil {
+		return key.(*ecdsa.PrivateKey)
+	}
+	return nil
 }
 
 func (a *App) AsymmetricSigningKey() *ecdsa.PrivateKey {
@@ -393,8 +399,9 @@ func (a *App) GetSanitizedConfig() *model.Config {
 }
 
 // GetEnvironmentConfig returns a map of configuration keys whose values have been overridden by an environment variable.
-func (a *App) GetEnvironmentConfig() map[string]interface{} {
-	return a.EnvironmentConfig()
+// If filter is not nil and returns false for a struct field, that field will be omitted.
+func (a *App) GetEnvironmentConfig(filter func(reflect.StructField) bool) map[string]interface{} {
+	return a.EnvironmentConfig(filter)
 }
 
 // SaveConfig replaces the active configuration, optionally notifying cluster peers.
@@ -406,12 +413,13 @@ func (s *Server) SaveConfig(newCfg *model.Config, sendConfigChangeClusterMessage
 		return model.NewAppError("saveConfig", "app.save_config.app_error", nil, err.Error(), http.StatusInternalServerError)
 	}
 
-	if s.Metrics != nil {
-		if *s.Config().MetricsSettings.Enable {
-			s.Metrics.StartServer()
-		} else {
-			s.Metrics.StopServer()
+	if s.startMetrics && *s.Config().MetricsSettings.Enable {
+		if s.Metrics != nil {
+			s.Metrics.Register()
 		}
+		s.SetupMetricsServer()
+	} else {
+		s.StopMetricsServer()
 	}
 
 	if s.Cluster != nil {
@@ -445,4 +453,26 @@ func (a *App) HandleMessageExportConfig(cfg *model.Config, appCfg *model.Config)
 			cfg.MessageExportSettings.ExportFromTimestamp = model.NewInt64(0)
 		}
 	}
+}
+
+func (s *Server) MailServiceConfig() *mail.SMTPConfig {
+	emailSettings := s.Config().EmailSettings
+	hostname := utils.GetHostnameFromSiteURL(*s.Config().ServiceSettings.SiteURL)
+	cfg := mail.SMTPConfig{
+		Hostname:                          hostname,
+		ConnectionSecurity:                *emailSettings.ConnectionSecurity,
+		SkipServerCertificateVerification: *emailSettings.SkipServerCertificateVerification,
+		ServerName:                        *emailSettings.SMTPServer,
+		Server:                            *emailSettings.SMTPServer,
+		Port:                              *emailSettings.SMTPPort,
+		ServerTimeout:                     *emailSettings.SMTPServerTimeout,
+		Username:                          *emailSettings.SMTPUsername,
+		Password:                          *emailSettings.SMTPPassword,
+		EnableSMTPAuth:                    *emailSettings.EnableSMTPAuth,
+		SendEmailNotifications:            *emailSettings.SendEmailNotifications,
+		FeedbackName:                      *emailSettings.FeedbackName,
+		FeedbackEmail:                     *emailSettings.FeedbackEmail,
+		ReplyToAddress:                    *emailSettings.ReplyToAddress,
+	}
+	return &cfg
 }
